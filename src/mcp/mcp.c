@@ -3102,7 +3102,7 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
 /* Write pattern to a temp file for grep -f. Returns true on success. */
 static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
 #ifdef _WIN32
-    snprintf(tmpfile, tmpfile_sz, "/tmp/cbm_search_%d.pat", (int)_getpid());
+    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)_getpid());
 #else
     snprintf(tmpfile, tmpfile_sz, "/tmp/cbm_search_%d.pat", getpid());
 #endif

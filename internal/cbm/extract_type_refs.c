@@ -102,6 +102,7 @@ static const char *extract_type_text(CBMArena *a, TSNode node, const char *sourc
 }
 
 // Add a type reference for a function.
+// Pushes to usages so the pipeline's resolve_file_usages creates a USAGE edge.
 static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn) {
     if (!type_name || !type_name[0]) {
         return;
@@ -114,10 +115,10 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
         return;
     }
 
-    CBMTypeRef tr;
-    tr.type_name = type_name;
-    tr.enclosing_func_qn = func_qn;
-    cbm_typerefs_push(&ctx->result->type_refs, ctx->arena, tr);
+    CBMUsage usage;
+    usage.ref_name = type_name;
+    usage.enclosing_func_qn = func_qn;
+    cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
 }
 
 // Extract parameter types from a parameters/formal_parameters node.
@@ -204,6 +205,8 @@ static void extract_java_body_type_refs(CBMExtractCtx *ctx, TSNode node, const c
     }
 }
 
+static void extract_csharp_type_refs(CBMExtractCtx *ctx, TSNode type_node, const char *enclosing_qn);
+
 // Process a single node for body-level type references.
 static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
     const char *kind = ts_node_type(node);
@@ -228,6 +231,19 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
             TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
             if (!ts_node_is_null(type_node)) {
                 add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), func_qn);
+            }
+        }
+        break;
+    case CBM_LANG_CSHARP:
+        // object_creation_expression: new T(...), new List<T>()
+        // typeof_expression: typeof(T)
+        // cast_expression: (T)x
+        if (strcmp(kind, "object_creation_expression") == 0 ||
+            strcmp(kind, "typeof_expression") == 0 ||
+            strcmp(kind, "cast_expression") == 0) {
+            TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+            if (!ts_node_is_null(type_node)) {
+                extract_csharp_type_refs(ctx, type_node, func_qn);
             }
         }
         break;
@@ -347,6 +363,55 @@ static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkSta
     extract_return_type_refs(ctx, node, func_qn);
 }
 
+// Recursively extract type refs from a C# type node, handling generics, nullables, and arrays.
+// For ICollection<FaultRuleDto>: emits refs for both ICollection and FaultRuleDto.
+static void extract_csharp_type_refs(CBMExtractCtx *ctx, TSNode type_node,
+                                      const char *enclosing_qn) {
+    if (ts_node_is_null(type_node)) {
+        return;
+    }
+    const char *kind = ts_node_type(type_node);
+
+    if (strcmp(kind, "generic_name") == 0) {
+        // generic_name: children are identifier (outer type) + type_argument_list
+        uint32_t nc = ts_node_child_count(type_node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_child(type_node, i);
+            const char *ck = ts_node_type(child);
+            if (strcmp(ck, "identifier") == 0) {
+                add_type_ref(ctx, cbm_node_text(ctx->arena, child, ctx->source), enclosing_qn);
+            } else if (strcmp(ck, "type_argument_list") == 0) {
+                uint32_t nta = ts_node_child_count(child);
+                for (uint32_t j = 0; j < nta; j++) {
+                    extract_csharp_type_refs(ctx, ts_node_child(child, j), enclosing_qn);
+                }
+            }
+        }
+    } else if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
+               strcmp(kind, "qualified_name") == 0) {
+        add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), enclosing_qn);
+    } else if (strcmp(kind, "nullable_type") == 0) {
+        // T? — unwrap to T
+        if (ts_node_child_count(type_node) > 0) {
+            extract_csharp_type_refs(ctx, ts_node_child(type_node, 0), enclosing_qn);
+        }
+    } else if (strcmp(kind, "array_type") == 0) {
+        // T[] — get element type
+        TSNode elem = ts_node_child_by_field_name(type_node, TS_FIELD("type"));
+        if (!ts_node_is_null(elem)) {
+            extract_csharp_type_refs(ctx, elem, enclosing_qn);
+        }
+    } else if (kind[0] != '<' && kind[0] != '>' && kind[0] != ',' && kind[0] != '?'
+               && kind[0] != '[' && kind[0] != ']') {
+        // Aux/repeat wrapper nodes (e.g. type_argument_list_repeat1): recurse into named children
+        uint32_t nc = ts_node_named_child_count(type_node);
+        for (uint32_t i = 0; i < nc; i++) {
+            extract_csharp_type_refs(ctx, ts_node_named_child(type_node, i), enclosing_qn);
+        }
+    }
+    // predefined_type (int, string, etc.) filtered by is_builtin_type in add_type_ref
+}
+
 void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->function_node_types || !spec->function_node_types[0]) {
         return;
@@ -355,6 +420,39 @@ void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, 
     if (cbm_kind_in_set(node, spec->function_node_types)) {
         extract_signature_type_refs(ctx, node, state);
         return;
+    }
+
+    // C# field and property declarations: extract type refs including generic type arguments.
+    // These are class-level nodes (not inside functions), so use enclosing_class_qn as source.
+    if (ctx->language == CBM_LANG_CSHARP) {
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "field_declaration") == 0) {
+            const char *enclosing_qn = state->enclosing_class_qn
+                                           ? state->enclosing_class_qn
+                                           : state->enclosing_func_qn;
+            // field_declaration wraps type inside variable_declaration — not a direct field
+            uint32_t nc = ts_node_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode child = ts_node_child(node, i);
+                if (strcmp(ts_node_type(child), "variable_declaration") == 0) {
+                    TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
+                    if (!ts_node_is_null(type_node)) {
+                        extract_csharp_type_refs(ctx, type_node, enclosing_qn);
+                    }
+                    break;
+                }
+            }
+            return;
+        } else if (strcmp(kind, "property_declaration") == 0) {
+            const char *enclosing_qn = state->enclosing_class_qn
+                                           ? state->enclosing_class_qn
+                                           : state->enclosing_func_qn;
+            TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+            if (!ts_node_is_null(type_node)) {
+                extract_csharp_type_refs(ctx, type_node, enclosing_qn);
+            }
+            return;
+        }
     }
 
     process_body_type_ref(ctx, node, state->enclosing_func_qn);
