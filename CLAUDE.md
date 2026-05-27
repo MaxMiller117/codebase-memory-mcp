@@ -51,4 +51,6 @@ See `docs/LOCAL_PATCHES.md`. Current divergence from upstream (DeusData v0.6.0):
 
 ## Cypher engine quirks (affect MCP usage, not the build)
 
-See `C:\Users\Max\.claude\projects\C--Users-Max-source-repos\memory\project_cbm_cypher.md`.
+See `~/.claude/docs/codebase-memory-mcp.md` — the "Cypher engine quirks" section is verified
+against the currently-deployed binary (which constructs work vs. throw parse errors), alongside the
+node-label / edge-type legends.
