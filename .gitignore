@@ -19,6 +19,7 @@ cli-*/
 # IDE
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 
