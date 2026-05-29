@@ -1,3 +1,9 @@
 # Vendored tree-sitter grammars — machine-generated, hide from stats and diffs
 internal/cbm/vendored/grammars/**/parser.c  linguist-generated=true diff=false
 internal/cbm/vendored/grammars/**/scanner.c linguist-generated=true diff=false
+
+# Shell scripts must stay LF — they run in WSL/bash. Without this they check out
+# CRLF on Windows and the shebang line breaks ("cannot execute: required file
+# not found"). Keeps scripts/*.sh (incl. embed-frontend.sh, build-ui-mingw.sh)
+# runnable straight from a Windows checkout.
+*.sh text eol=lf
