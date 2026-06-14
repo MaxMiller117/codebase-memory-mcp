@@ -2671,6 +2671,61 @@ static int search_result_cmp(const void *a, const void *b) {
 static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
                            const char *root_path) {
+#ifdef _WIN32
+    /* Windows: _popen runs cmd.exe, which has no grep/xargs and mis-parses the
+     * POSIX command below. Use PowerShell Select-String, written to a temp .ps1
+     * and run via -File. (An inline -Command "...|...|..." through cmd.exe
+     * mis-parses the nested quotes + pipes -- "The filename, directory name, or
+     * volume label syntax is incorrect" -- and returns 0 matches.) Emit
+     * TAB-delimited path<TAB>line<TAB>content with forward-slash paths so
+     * collect_grep_matches' Windows parser can split it (Windows drive colons
+     * make colon-splitting impossible). */
+    const char *sm = use_regex ? "" : " -SimpleMatch";
+    char body[CBM_SZ_4K];
+    if (scoped) {
+        if (file_pattern) {
+            snprintf(body, sizeof(body),
+                     "$pat = Get-Content '%s'; Get-Content '%s' | ForEach-Object { "
+                     "Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction SilentlyContinue }"
+                     " | Where-Object { $_.Path -like '*%s' }"
+                     " | ForEach-Object { ($_.Path -replace '\\\\','/') + [char]9 + $_.LineNumber "
+                     "+ [char]9 + $_.Line }",
+                     tmpfile, filelist, sm, file_pattern);
+        } else {
+            snprintf(body, sizeof(body),
+                     "$pat = Get-Content '%s'; Get-Content '%s' | ForEach-Object { "
+                     "Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction SilentlyContinue }"
+                     " | ForEach-Object { ($_.Path -replace '\\\\','/') + [char]9 + $_.LineNumber "
+                     "+ [char]9 + $_.Line }",
+                     tmpfile, filelist, sm);
+        }
+    } else {
+        if (file_pattern) {
+            snprintf(body, sizeof(body),
+                     "Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File -ErrorAction "
+                     "SilentlyContinue | Select-String -Pattern (Get-Content '%s')%s -ErrorAction "
+                     "SilentlyContinue | ForEach-Object { ($_.Path -replace '\\\\','/') + [char]9 "
+                     "+ $_.LineNumber + [char]9 + $_.Line }",
+                     root_path, file_pattern, tmpfile, sm);
+        } else {
+            snprintf(body, sizeof(body),
+                     "Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction SilentlyContinue "
+                     "| Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue "
+                     "| ForEach-Object { ($_.Path -replace '\\\\','/') + [char]9 + $_.LineNumber "
+                     "+ [char]9 + $_.Line }",
+                     root_path, tmpfile, sm);
+        }
+    }
+    char ps1path[CBM_SZ_256];
+    snprintf(ps1path, sizeof(ps1path), "%s.ps1", tmpfile);
+    FILE *psf = fopen(ps1path, "w");
+    if (psf) {
+        fputs(body, psf);
+        fputc('\n', psf);
+        (void)fclose(psf);
+    }
+    snprintf(cmd, cmd_sz, "powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\"", ps1path);
+#else
     const char *flag = use_regex ? "-E" : "-F";
     if (scoped) {
         if (file_pattern) {
@@ -2688,6 +2743,7 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
             snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
         }
     }
+#endif
 }
 
 /* Build deduplicated file list from search results + raw matches. */
@@ -2908,11 +2964,16 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
             continue;
         }
 
-        char *colon1 = strchr(line, ':');
+#ifdef _WIN32
+        const char delim = '\t'; /* Windows search emits TAB-delimited (drive colons break colon-splitting) */
+#else
+        const char delim = ':';
+#endif
+        char *colon1 = strchr(line, delim);
         if (!colon1) {
             continue;
         }
-        char *colon2 = strchr(colon1 + SKIP_ONE, ':');
+        char *colon2 = strchr(colon1 + SKIP_ONE, delim);
         if (!colon2) {
             continue;
         }
@@ -3115,6 +3176,17 @@ static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *patter
     return true;
 }
 
+/* Remove the temp .ps1 written for the Windows search shell-out (no-op on POSIX). */
+static void unlink_search_ps1(const char *tmpfile) {
+#ifdef _WIN32
+    char ps1path[CBM_SZ_256];
+    snprintf(ps1path, sizeof(ps1path), "%s.ps1", tmpfile);
+    cbm_unlink(ps1path);
+#else
+    (void)tmpfile;
+#endif
+}
+
 /* Compile a path filter regex. Returns true if compiled successfully. */
 static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
     if (!filter || !filter[0]) {
@@ -3214,6 +3286,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         if (scoped) {
             cbm_unlink(filelist);
         }
+        unlink_search_ps1(tmpfile);
         free(root_path);
         free(pattern);
         free(project);
@@ -3230,6 +3303,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (scoped) {
         cbm_unlink(filelist);
     }
+    unlink_search_ps1(tmpfile);
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
     /* Sort grep matches by file for contiguous processing.
