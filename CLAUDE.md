@@ -1,5 +1,11 @@
 # codebase-memory-mcp — Local Build Notes
 
+> **Operational issues to fix** (observed in real multi-agent use, 2026-06-18) → see
+> [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md): (1) `project` arg should default to the
+> sole/monolith project instead of 404-ing on unknown/short names (`resolve_store()` in
+> `src/mcp/mcp.c`); (2) `search_graph` is slow under concurrent multi-agent load — likely
+> serial request dispatch in the stdio loop.
+
 ## Build (Windows via WSL cross-compile)
 
 WSL distro: `Ubuntu-24.04`. MinGW toolchain: `x86_64-w64-mingw32-gcc` / `-g++`.
