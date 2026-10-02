@@ -1316,7 +1316,8 @@ static const int SUPPORTED_VERSION_COUNT =
 static const char MCP_SERVER_INSTRUCTIONS[] =
     "Graph first: search_graph for symbols, trace_path for relationships, get_code_snippet for "
     "source, query_graph for multi-hop, and get_architecture for overview. Use search_code/grep "
-    "for literals or coverage gaps. Indexes auto-refresh. Check cited-path coverage; paginate.";
+    "for literals or coverage gaps. Indexes auto-refresh only when auto_watch is on; otherwise "
+    "they change only on index_repository. Check cited-path coverage; paginate.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
     "analysis tool profile: read-only graph work via search_graph, trace_path, "

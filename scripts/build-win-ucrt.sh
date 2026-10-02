@@ -18,5 +18,6 @@ cd "$(dirname "$0")/.."
 [ "${2:-}" = clean ] && rm -rf build/c
 make -f Makefile.cbm cbm CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ CXX_STDLIB=-lc++ \
   CFLAGS_EXTRA="-DCBM_VERSION=\\\"$VER\\\"" -j"$(nproc)"
-x86_64-w64-mingw32-objdump -p build/c/codebase-memory-mcp.exe | grep -q 'api-ms-win-crt-runtime' || { echo "FAIL: binary does not link UCRT"; exit 1; }
+imports="$(x86_64-w64-mingw32-objdump -p build/c/codebase-memory-mcp.exe)"
+[[ "$imports" == *api-ms-win-crt-runtime* ]] || { echo "FAIL: binary does not link UCRT"; exit 1; }
 echo "OK: build/c/codebase-memory-mcp.exe ($VER, UCRT)"
