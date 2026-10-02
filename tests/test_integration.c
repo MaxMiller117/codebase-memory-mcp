@@ -310,6 +310,33 @@ TEST(integ_mcp_search_graph_by_name) {
     PASS();
 }
 
+TEST(integ_mcp_search_graph_bm25_file_pattern) {
+    char args[256];
+    snprintf(args, sizeof(args),
+             "{\"query\":\"greet Add\",\"file_pattern\":\"*.go\",\"project\":\"%s\"}", g_project);
+
+    char *resp = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "bm25"));
+    ASSERT_NOT_NULL(strstr(resp, "utils.go"));
+    ASSERT_NULL(strstr(resp, "main.py"));
+    free(resp);
+    PASS();
+}
+
+TEST(integ_mcp_search_graph_bm25_label) {
+    char args[256];
+    snprintf(args, sizeof(args), "{\"query\":\"greet\",\"label\":\"Class\",\"project\":\"%s\"}",
+             g_project);
+
+    char *resp = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "bm25"));
+    ASSERT_NULL(strstr(resp, "main.py"));
+    free(resp);
+    PASS();
+}
+
 TEST(integ_mcp_query_graph_functions) {
     char args[512];
     snprintf(args, sizeof(args),
@@ -549,6 +576,8 @@ SUITE(integration) {
     RUN_TEST(integ_mcp_list_projects);
     RUN_TEST(integ_mcp_search_graph_by_label);
     RUN_TEST(integ_mcp_search_graph_by_name);
+    RUN_TEST(integ_mcp_search_graph_bm25_file_pattern);
+    RUN_TEST(integ_mcp_search_graph_bm25_label);
     RUN_TEST(integ_mcp_query_graph_functions);
     RUN_TEST(integ_mcp_query_graph_calls);
     RUN_TEST(integ_mcp_get_graph_schema);

@@ -292,7 +292,7 @@ static const tool_def_t TOOLS[] = {
      "indexed as individual words (updateCloudClient → update, cloud, client). Results are "
      "ranked with structural boosting: Functions/Methods +10, Routes +8, Classes/Interfaces +5. "
      "Noise labels (File/Folder/Module/Variable) are filtered out. When provided, name_pattern "
-     "is ignored.\"},"
+     "is ignored; file_pattern and label still filter the ranked hits.\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
@@ -1111,6 +1111,8 @@ enum {
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
     BM25_BIND_OFFSET = 4,
+    BM25_BIND_FILE = 5,
+    BM25_BIND_LABEL = 6,
     BM25_SQL_AUTO_LEN = -1,
 };
 
@@ -1166,8 +1168,22 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
 /* Run the BM25 full-text search path and return the JSON result string.
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
-static char *bm25_search(cbm_store_t *store, const char *project, const char *query, int limit,
-                         int offset) {
+/* Bind the optional file_pattern (as LIKE) and label filters; NULL disables each. */
+static void bm25_bind_filters(sqlite3_stmt *stmt, const char *file_like, const char *label) {
+    if (file_like) {
+        sqlite3_bind_text(stmt, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_FILE);
+    }
+    if (label && label[0]) {
+        sqlite3_bind_text(stmt, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_LABEL);
+    }
+}
+
+static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
+                         const char *file_pattern, const char *label, int limit, int offset) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -1177,11 +1193,14 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (tok_count == 0) {
         return NULL;
     }
+    char *file_like = cbm_glob_to_like(file_pattern);
 
     /* BM25 ranked query with structural label boosting.  bm25() returns a
      * NEGATIVE score (lower = more relevant), so we subtract the boost to
      * make high-value labels sort first.  File/Folder/Module/Variable are
-     * excluded entirely — agents rarely want those as discovery results. */
+     * excluded entirely — agents rarely want those as discovery results.
+     * CROSS JOIN pins nodes_fts as the outer loop: with nodes outer, SQLite
+     * re-runs the FTS MATCH once per project row (60 s+ on a 317k-node index). */
     const char *sql =
         "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
         "       (bm25(nodes_fts) "
@@ -1190,41 +1209,49 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
         "               ELSE 0.0 END) AS rank "
         "FROM nodes_fts "
-        "JOIN nodes n ON n.id = nodes_fts.rowid "
+        "CROSS JOIN nodes n ON n.id = nodes_fts.rowid "
         "WHERE nodes_fts MATCH ?1 "
         "  AND n.project = ?2 "
         "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        "  AND (?5 IS NULL OR n.file_path LIKE ?5) "
+        "  AND (?6 IS NULL OR n.label = ?6) "
         "ORDER BY rank "
         "LIMIT ?3 OFFSET ?4";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        free(file_like);
         return NULL;
     }
     sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
     sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
+    bm25_bind_filters(stmt, file_like, label);
 
-    /* Count total hits (for pagination) in a separate cheap query. */
+    /* Count total hits (for pagination); filters MIRROR the ranked query. */
     int total = 0;
     {
         const char *count_sql =
-            "SELECT COUNT(*) FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid "
+            "SELECT COUNT(*) FROM nodes_fts CROSS JOIN nodes n ON n.id = nodes_fts.rowid "
             "WHERE nodes_fts MATCH ?1 AND n.project = ?2 "
-            "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')";
+            "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+            "  AND (?5 IS NULL OR n.file_path LIKE ?5) "
+            "  AND (?6 IS NULL OR n.label = ?6)";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
             sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
             sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
+            bm25_bind_filters(cs, file_like, label);
             if (sqlite3_step(cs) == SQLITE_ROW) {
                 total = sqlite3_column_int(cs, 0);
             }
             sqlite3_finalize(cs);
         }
     }
+    free(file_like);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1371,7 +1398,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (query && query[0]) {
         int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
-        char *bm25_json = bm25_search(store, project, query, q_limit, q_offset);
+        char *q_file = cbm_mcp_get_string_arg(args, "file_pattern");
+        char *q_label = cbm_mcp_get_string_arg(args, "label");
+        char *bm25_json = bm25_search(store, project, query, q_file, q_label, q_limit, q_offset);
+        free(q_file);
+        free(q_label);
         if (bm25_json) {
             free(query);
             free(project);
