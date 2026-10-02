@@ -6,7 +6,10 @@
  */
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
+#include "foundation/mem_core.h"
+#include <stdatomic.h>
 #include "store/store.h"
+#include <string.h>
 
 /* ── Node operations ───────────────────────────────────────────── */
 
@@ -167,6 +170,195 @@ TEST(gbuf_edge_dedup) {
     /* Different type = different edge */
     int64_t eid3 = cbm_gbuf_insert_edge(gb, n1, n2, "IMPORTS", "{}");
     ASSERT_NEQ(eid1, eid3);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* Properties on a deduped edge must not depend on arrival order.
+ *
+ * confidence/strategy/via are not part of the edge key, and the same logical
+ * CALLS edge is legitimately minted by two strategies (LSP resolution and
+ * registry-textual matching) carrying different values. Per-worker edge buffers
+ * merge in worker-slot order, so an arrival-order-dependent merge makes the
+ * stored attributes a function of thread scheduling. Insert the same pair of
+ * blobs in both orders; the stored properties must match. */
+TEST(gbuf_edge_props_merge_is_order_independent) {
+    const char *lsp = "{\"callee\":\"f\",\"confidence\":0.95,\"strategy\":\"lsp\"}";
+    const char *txt = "{\"callee\":\"f\",\"confidence\":0.40,\"strategy\":\"registry\"}";
+
+    cbm_gbuf_t *fwd = cbm_gbuf_new("test", "/tmp");
+    int64_t a1 = cbm_gbuf_upsert_node(fwd, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b1 = cbm_gbuf_upsert_node(fwd, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    cbm_gbuf_insert_edge(fwd, a1, b1, "CALLS", lsp);
+    cbm_gbuf_insert_edge(fwd, a1, b1, "CALLS", txt);
+
+    cbm_gbuf_t *rev = cbm_gbuf_new("test", "/tmp");
+    int64_t a2 = cbm_gbuf_upsert_node(rev, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b2 = cbm_gbuf_upsert_node(rev, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    cbm_gbuf_insert_edge(rev, a2, b2, "CALLS", txt);
+    cbm_gbuf_insert_edge(rev, a2, b2, "CALLS", lsp);
+
+    const cbm_gbuf_edge_t **fe = NULL;
+    const cbm_gbuf_edge_t **re = NULL;
+    int fc = 0;
+    int rc = 0;
+    cbm_gbuf_find_edges_by_type(fwd, "CALLS", &fe, &fc);
+    cbm_gbuf_find_edges_by_type(rev, "CALLS", &re, &rc);
+    ASSERT_EQ(fc, 1);
+    ASSERT_EQ(rc, 1);
+    ASSERT_STR_EQ(fe[0]->properties_json, re[0]->properties_json);
+
+    cbm_gbuf_free(fwd);
+    cbm_gbuf_free(rev);
+    PASS();
+}
+
+/* The order-independent winner is also the semantically right one: a
+ * higher-confidence discovery outranks a lower-confidence one regardless of
+ * which arrived first. */
+TEST(gbuf_edge_props_merge_prefers_higher_confidence) {
+    const char *lsp = "{\"callee\":\"f\",\"confidence\":0.95,\"strategy\":\"lsp\"}";
+    const char *txt = "{\"callee\":\"f\",\"confidence\":0.40,\"strategy\":\"registry\"}";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", lsp);
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", txt); /* lower confidence, arrives last */
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CALLS", &edges, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"strategy\":\"lsp\"") != NULL);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* A confidence the code cannot read is not evidence of anything, so it must
+ * not outrank an edge that simply carries no confidence at all.
+ *
+ * edge_props_confidence answers -1 for "absent" so that any real confidence
+ * beats it. strtod answers 0.0 for text it cannot read, so an unreadable
+ * value used to come back as a real confidence of zero -- which beats -1 and
+ * displaced the stored blob. The function's own comment already promised
+ * that "absent/unparseable reads as -1"; only the absent half was true. */
+TEST(gbuf_edge_props_unreadable_confidence_does_not_displace_absent) {
+    const char *no_conf = "{\"callee\":\"f\",\"strategy\":\"lsp\"}";
+    const char *bad_conf = "{\"callee\":\"f\",\"confidence\":null,\"strategy\":\"registry\"}";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", no_conf);
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", bad_conf); /* unreadable, arrives last */
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CALLS", &edges, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"strategy\":\"lsp\"") != NULL);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* An empty incoming blob must never displace real stored properties. */
+TEST(gbuf_edge_props_merge_keeps_existing_on_empty) {
+    const char *lsp = "{\"callee\":\"f\",\"confidence\":0.95,\"strategy\":\"lsp\"}";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", lsp);
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}");
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CALLS", &edges, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"strategy\":\"lsp\"") != NULL);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* #768: two named imports from the same specifier (same source, same target
+ * file) must produce two distinct IMPORTS edges, keyed apart by local_name --
+ * not collapse into one edge that silently drops whichever import lost the
+ * dedup race. Re-inserting the SAME local_name (e.g. an idempotent re-index)
+ * must still dedup to one edge. */
+TEST(gbuf_imports_multi_symbol_dedup) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t consumer =
+        cbm_gbuf_upsert_node(gb, "File", "consumer.ts", "pkg.consumer", "consumer.ts", 1, 1, "{}");
+    int64_t lib = cbm_gbuf_upsert_node(gb, "File", "lib.ts", "pkg.lib", "lib.ts", 1, 1, "{}");
+
+    int64_t eid_a = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"A\"}");
+    int64_t eid_b = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"B\"}");
+    ASSERT_GT(eid_a, 0);
+    ASSERT_GT(eid_b, 0);
+    ASSERT_NEQ(eid_a, eid_b); /* distinct symbols -> distinct edges */
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, consumer, "IMPORTS", &edges, &count);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"local_name\":\"A\"") != NULL ||
+                strstr(edges[1]->properties_json, "\"local_name\":\"A\"") != NULL);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"local_name\":\"B\"") != NULL ||
+                strstr(edges[1]->properties_json, "\"local_name\":\"B\"") != NULL);
+
+    /* Re-inserting the same symbol (idempotent re-index) still dedups. */
+    int64_t eid_a_again =
+        cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", "{\"local_name\":\"A\"}");
+    ASSERT_EQ(eid_a_again, eid_a);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* #768 hardening: the dedup key lives in a fixed-size stack buffer. Two long
+ * local_names sharing a prefix must NOT silently collide when the verbatim
+ * key would be truncated — the key builder re-keys oversized local_names with
+ * a hash of the FULL name. Determinism must hold: re-inserting the same long
+ * name still dedups to the same edge. */
+TEST(gbuf_imports_long_local_name_no_collision) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t consumer =
+        cbm_gbuf_upsert_node(gb, "File", "consumer.ts", "pkg.consumer", "consumer.ts", 1, 1, "{}");
+    int64_t lib = cbm_gbuf_upsert_node(gb, "File", "lib.ts", "pkg.lib", "lib.ts", 1, 1, "{}");
+
+    /* 300-char shared prefix, distinct 4-char tails — a truncated verbatim
+     * key keeps only the shared prefix and would merge the two edges. */
+    enum { LONG_PREFIX = 300 };
+    char name_a[LONG_PREFIX + 8];
+    char name_b[LONG_PREFIX + 8];
+    memset(name_a, 'x', LONG_PREFIX);
+    memset(name_b, 'x', LONG_PREFIX);
+    memcpy(name_a + LONG_PREFIX, "AAAA", 5);
+    memcpy(name_b + LONG_PREFIX, "BBBB", 5);
+
+    char props_a[512];
+    char props_b[512];
+    snprintf(props_a, sizeof(props_a), "{\"local_name\":\"%s\"}", name_a);
+    snprintf(props_b, sizeof(props_b), "{\"local_name\":\"%s\"}", name_b);
+
+    int64_t eid_a = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", props_a);
+    int64_t eid_b = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", props_b);
+    ASSERT_GT(eid_a, 0);
+    ASSERT_GT(eid_b, 0);
+    ASSERT_NEQ(eid_a, eid_b); /* prefix-sharing long names stay distinct */
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
+
+    /* Hash re-keying is deterministic: same long name dedups. */
+    int64_t eid_a_again = cbm_gbuf_insert_edge(gb, consumer, lib, "IMPORTS", props_a);
+    ASSERT_EQ(eid_a_again, eid_a);
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 2);
 
     cbm_gbuf_free(gb);
@@ -367,9 +559,9 @@ TEST(gbuf_upsert_empty_qn) {
 TEST(gbuf_upsert_same_qn_updates_all_fields) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id1 = cbm_gbuf_upsert_node(gb, "Function", "old_name", "pkg.fn", "old.go", 1, 10,
-                                        "{\"k\":\"v1\"}");
+                                       "{\"k\":\"v1\"}");
     int64_t id2 = cbm_gbuf_upsert_node(gb, "Method", "new_name", "pkg.fn", "new.go", 20, 30,
-                                        "{\"k\":\"v2\"}");
+                                       "{\"k\":\"v2\"}");
     ASSERT_EQ(id1, id2);
     ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
 
@@ -637,7 +829,8 @@ TEST(gbuf_merge_overlapping_qns) {
     cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
 
     /* dst has node with QN "pkg.fn" */
-    cbm_gbuf_upsert_node(dst, "Function", "fn_old", "pkg.fn", "old.go", 1, 10, "{\"from\":\"dst\"}");
+    cbm_gbuf_upsert_node(dst, "Function", "fn_old", "pkg.fn", "old.go", 1, 10,
+                         "{\"from\":\"dst\"}");
     cbm_gbuf_upsert_node(dst, "Function", "unique_dst", "pkg.unique_dst", "u.go", 1, 5, "{}");
 
     /* src has same QN with different fields — src should win */
@@ -929,7 +1122,38 @@ TEST(gbuf_flush_skips_orphan_edges) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* A worker buffer draws ids from the shared counter, so a dense id -> node
+ * array in it spans the whole global id space: 18 workers x (next power of
+ * two above the highest id) x 8 B, doubling in lockstep -- a 1 GB step
+ * inside one gate interval on the kernel at 8M ids (2026-09-14). A worker
+ * buffer is never asked by id before the merge, so it keeps no such array;
+ * the main buffer it merges into still answers by id. One node at id 2M
+ * would cost a 16 MB array; the index class must not grow by even 1 MB. */
+TEST(gbuf_worker_buffer_keeps_no_by_id_array) {
+    _Atomic int64_t ids;
+    atomic_init(&ids, (int64_t)1 << 21);
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_INDEX);
+    cbm_gbuf_t *w = cbm_gbuf_new_worker("p", "/r", &ids);
+    ASSERT_NOT_NULL(w);
+    int64_t id = cbm_gbuf_upsert_node(w, "Function", "f", "p.f", "a.c", 1, 2, "{}");
+    ASSERT_TRUE(id >= ((int64_t)1 << 21));
+    size_t after = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_INDEX);
+    size_t grown = after > before ? after - before : 0;
+    ASSERT_TRUE(grown < ((size_t)1 << 20));
+    ASSERT_TRUE(cbm_gbuf_find_by_id(w, id) == NULL);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(w, "p.f"));
+
+    cbm_gbuf_t *main_gb = cbm_gbuf_new("p", "/r");
+    ASSERT_NOT_NULL(main_gb);
+    cbm_gbuf_merge(main_gb, w);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_id(main_gb, id));
+    cbm_gbuf_free(w);
+    cbm_gbuf_free(main_gb);
+    PASS();
+}
+
 SUITE(graph_buffer) {
+    RUN_TEST(gbuf_worker_buffer_keeps_no_by_id_array);
     /* Original tests */
     RUN_TEST(gbuf_create_free);
     RUN_TEST(gbuf_free_null);
@@ -941,6 +1165,8 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_delete_by_label);
     RUN_TEST(gbuf_insert_edge);
     RUN_TEST(gbuf_edge_dedup);
+    RUN_TEST(gbuf_imports_multi_symbol_dedup);
+    RUN_TEST(gbuf_imports_long_local_name_no_collision);
     RUN_TEST(gbuf_find_edges_by_source_type);
     RUN_TEST(gbuf_find_edges_by_target_type);
     RUN_TEST(gbuf_find_edges_by_type);
@@ -983,6 +1209,12 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_flush_verify_store_data);
     RUN_TEST(gbuf_merge_into_store_preserves);
     RUN_TEST(gbuf_flush_skips_orphan_edges);
+
+    /* Edge property merge determinism */
+    RUN_TEST(gbuf_edge_props_merge_is_order_independent);
+    RUN_TEST(gbuf_edge_props_merge_prefers_higher_confidence);
+    RUN_TEST(gbuf_edge_props_unreadable_confidence_does_not_displace_absent);
+    RUN_TEST(gbuf_edge_props_merge_keeps_existing_on_empty);
 
     /* Shared ID tests */
     RUN_TEST(gbuf_shared_ids_unique);

@@ -1,118 +1,65 @@
-# codebase-memory-mcp — Local Build Notes
+# codebase-memory-mcp — FleetHd fork
 
-## Build (Windows via WSL cross-compile)
+This fork is upstream DeusData v0.11.0 plus the local patches in `docs/LOCAL_PATCHES.md`. Version names use
+the form `0.11.0-fleethd.N`. Usage rules for agents (query forms, paging, known engine limits) are in
+`~/.claude/docs/codebase-memory-mcp.md`; this file covers build, deploy and release only.
 
-WSL distro: `Ubuntu-24.04`. MinGW toolchain: `x86_64-w64-mingw32-gcc` / `-g++`.
+## Build (Windows binary, cross-compiled in WSL)
 
-```bash
-# In WSL Ubuntu-24.04:
-cd /mnt/c/Users/Max/source/repos/codebase-memory-mcp
-touch internal/cbm/extract_type_refs.c   # force recompile; Makefile default target is 'build/c' dir
-make -f Makefile.cbm cbm CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ -j4
-```
+Use the llvm-mingw toolchain (clang + UCRT) in WSL `Ubuntu-24.04`, at `~/toolchains/llvm-mingw-*-ucrt-ubuntu-*-x86_64`.
 
-Output: `build/c/codebase-memory-mcp.exe`
-
-## Build with embedded UI (graph visualization)
-
-The default `cbm` build links a UI **stub** (`embedded_stub.c`) — the HTTP/graph
-server is compiled in but serves nothing. To get the real graph UI you must
-embed the built frontend. The stock `cbm-with-ui` Makefile target assumes a
-native Linux/mac build (runs `npm` itself, embeds via `ld -r -b binary` → ELF),
-neither of which works in the WSL→MinGW cross-compile. Use the two-step flow:
-
-```powershell
-# Step 1 — build the frontend ON WINDOWS (WSL has no Linux node; fnm node is on
-# the Windows PATH). Produces graph-ui/dist.
-cd graph-ui ; npm ci ; npm run build ; cd ..
-```
+> **⚠ Do not build with Ubuntu's `x86_64-w64-mingw32-gcc`.** It links `msvcrt.dll`, and that binary fails every
+> index run with `pipeline.stage action=lock_failed errno=22`. Upstream builds with MSYS2 CLANG64, which also links UCRT.
 
 ```bash
-# Step 2 — embed + cross-compile, IN WSL Ubuntu-24.04 from the repo root:
-bash scripts/build-ui-mingw.sh
+# In WSL, from the repo root. The first run also builds zlib into the toolchain (set ZLIB_TGZ to zlib-1.3.1.tar.gz).
+bash scripts/build-win-ucrt.sh 0.11.0-fleethd.N          # warm build, ~3 min
+bash scripts/build-win-ucrt.sh 0.11.0-fleethd.N clean    # cold build
 ```
 
-Output: `build/c/cbm-ui.exe` (the no-UI `cbm` binary + ~1.4 MB of embedded
-assets). The script builds the prod object files first if the tree is cold
-(~10-15 min), then embeds and links; warm rebuilds are ~2-3 min.
-
-### Deploy the UI build
-
-```powershell
-# Rename-in-place (running MCP procs lock the file; renaming a running image is
-# allowed, so this needs no process kills — new binary takes effect on next start):
-$dst = "$env:LOCALAPPDATA\codebase-memory-mcp\codebase-memory-mcp.exe"
-Move-Item $dst "$dst.old" -Force
-Copy-Item build\c\cbm-ui.exe $dst -Force
-```
-
-The UI is gated on a persisted config flag. Enable it once (writes
-`%USERPROFILE%\.cache\codebase-memory-mcp\config.json`):
-
-```json
-{ "ui_enabled": true, "ui_port": 9749 }
-```
-
-Or pass `--ui=true --port=9749` on any invocation (the flags persist to that
-config). Restart Claude Code; the MCP server starts the UI on a background
-thread and serves it at **http://localhost:9749**. To try the binary standalone
-without the MCP host, keep stdin open so the MCP stdio loop doesn't hit EOF:
-
-```bash
-sleep 3600 | ./build/c/cbm-ui.exe --ui=true --port=9749   # then open the URL
-```
-
-### UI build gotchas
-
-- **Frontend must be built first** — `build-ui-mingw.sh` errors out if
-  `graph-ui/dist` is missing. It does not run `npm` (no Linux node in WSL).
-- **ELF vs PE embedding** — the script forces `embed-frontend.sh` down its
-  portable C-byte-array path (`IS_LINUX=false`) so the MinGW CC emits COFF
-  objects. Letting it auto-detect Linux yields ELF objects the linker rejects.
-- **Output-file lock** — Windows/AV may briefly lock the freshly-written exe;
-  the script links to `cbm-ui.exe` (a fresh name) to avoid `ld: cannot open
-  output file ...: Permission denied`. Deploy by copying that file.
-- **`*.sh` line endings** — `.gitattributes` pins shell scripts to LF; a CRLF
-  checkout breaks the shebang in WSL. Run scripts as `bash scripts/<x>.sh`.
+The output is `build/c/codebase-memory-mcp.exe`. The script fails if the binary does not link UCRT.
+The UI is not built (the binary links `embedded_stub.c`). FleetHd runs with `ui_enabled=false`.
 
 ## Deploy
 
+> **⚠ Close every Claude Code session first.** v0.11 runs one account-wide daemon per version and per cache
+> folder. A new build refuses to start while any process of another build runs, so a rename-in-place
+> deploy breaks every session that starts later.
+
 ```powershell
-# Kill running MCP proc first (file is locked while running):
-#   wmic process where "ExecutablePath like '%codebase-memory%'" get ProcessId
-#   Stop-Process -Id <pid> -Force
-Copy-Item build\c\codebase-memory-mcp.exe `
-    "$env:LOCALAPPDATA\codebase-memory-mcp\codebase-memory-mcp.exe" -Force
+& scripts\deploy-win.ps1     # refuses while any CBM process runs; keeps the old exe as <exe>.<version>
 ```
 
-Restart Claude Code to reconnect the MCP server.
+Start the sessions again after the script prints `OK:`.
 
-## Re-index after binary swap
+**Re-index after a change to extraction** (any change under `internal/cbm/` or `src/pipeline/`):
+run `/refresh-monolith`, or `codebase-memory-mcp cli index_repository --repo-path C:/Users/Max/source/repos`.
+A text-only or query-side change needs no re-index. The run returns one of these statuses:
+- `aborted_previous_preserved`: files changed during the run. Run it again.
+- `persist_failed`: a process still holds the old DB open. Close it, then run it again.
 
-Extraction changes require a fresh index (delta detection sees unchanged source files):
+## Release (for teammates)
 
-```bash
-./build/c/codebase-memory-mcp.exe cli delete_project '{"project":"C-Users-Max-source-repos"}'
-./build/c/codebase-memory-mcp.exe cli index_repository '{"repo_path":"C:/Users/Max/source/repos","project":"C-Users-Max-source-repos"}'
+The shared plugin `fleet-hd-claude/plugins/codebase-memory-mcp` installs the Windows binary from a release on
+this fork. To publish one:
+
+```powershell
+$v = 'v0.11.0-fleethd.N'; $out = "$env:TEMP\cbm-release"; New-Item -ItemType Directory -Force $out | Out-Null
+Compress-Archive build\c\codebase-memory-mcp.exe "$out\codebase-memory-mcp-windows-amd64.zip" -Force
+$h = (Get-FileHash "$out\codebase-memory-mcp-windows-amd64.zip" -Algorithm SHA256).Hash.ToLower()
+"$h  codebase-memory-mcp-windows-amd64.zip" | Set-Content "$out\checksums.txt"
+gh release create $v "$out\codebase-memory-mcp-windows-amd64.zip" "$out\checksums.txt" `
+  --repo MaxMiller117/codebase-memory-mcp --target main --title $v --notes-file <notes>
 ```
 
-CLI JSON field names: `project` (not `project_name`), `repo_path` (not `path`).
+Then update the pinned tag in the plugin README with a PR on `fleet-hd-claude` (Azure DevOps).
 
-## Local patches
+## Update to a new upstream release
 
-See `docs/LOCAL_PATCHES.md`. Current divergence from upstream (DeusData v0.6.0):
-
-- C# class-level property/field type refs (`extract_type_refs.c`)
-- C# method-body type refs for `object_creation_expression`, `typeof_expression`, `cast_expression`
-
-## Makefile gotchas
-
-- Default target is the `$(BUILD_DIR)` directory (`build/c`), which exists → `make -f Makefile.cbm` with no args says "up to date". Always pass `cbm` target explicitly.
-- Production binary is a unity build (all sources linked in one gcc call), not per-file object compilation, so changing one source rebuilds the whole binary (~2–3 min).
-- On MinGW the output is `codebase-memory-mcp.exe` but the Makefile target name is `codebase-memory-mcp` (no .exe) — make never sees the target as "existing", so it always rebuilds when invoked.
-
-## Cypher engine quirks (affect MCP usage, not the build)
-
-See `~/.claude/docs/codebase-memory-mcp.md` — the "Cypher engine quirks" section is verified
-against the currently-deployed binary (which constructs work vs. throw parse errors), alongside the
-node-label / edge-type legends.
+1. Make a branch from the upstream tag and apply the patches in `docs/LOCAL_PATCHES.md`.
+2. Build, then index into the live cache only after all sessions close (see Deploy).
+3. Before the deploy, run these checks. Stock v0.11.0 failed each of them:
+   - `MATCH (b {name:'FaultRuleDto'})<-[:USAGE]-(a {name:'AlertRuleDto'}) RETURN a.file_path` returns the `fleet-hd-contracts` row.
+   - `search_graph(query="get async vehicle", file_pattern="*fleet-hd-alert-notification/*")` returns `total` greater than 0 with `total_relation: eq`.
+   - `MATCH (b {name:'TroubleCodeDto'})<-[:USAGE]-(a) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(a)` returns a row.
+4. Merge the branch into `main` and publish a release.

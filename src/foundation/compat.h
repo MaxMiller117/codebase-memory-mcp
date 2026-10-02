@@ -8,8 +8,17 @@
 #ifndef CBM_COMPAT_H
 #define CBM_COMPAT_H
 
+#include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+/* stdlib.h declares getenv (cbm_tmpdir) and, on Windows, _putenv_s (cbm_setenv/
+ * cbm_unsetenv). The x86-64 mingw toolchain pulled it in transitively, but the
+ * aarch64 (CLANGARM64) include chain does not, so include it directly — without
+ * it those calls become implicit declarations that conflict with the real
+ * stdlib.h types and fail to compile on native ARM64 Windows. */
+#include <stdlib.h>
 
 /* ── Thread-local storage ─────────────────────────────────────── */
 /* _Thread_local is C11 standard — works on GCC, Clang, and MSVC (2019+).
@@ -88,6 +97,19 @@ static inline int cbm_nanosleep(const struct timespec *req, struct timespec *rem
 #define cbm_nanosleep nanosleep
 #endif
 
+/* Sleeps for the full requested duration even when POSIX signals interrupt it. */
+int cbm_nanosleep_full(const struct timespec *req);
+
+/* Per-CALLING-THREAD CPU time in nanoseconds. Unlike cbm_clock_gettime — which
+ * measures WALL time on every platform (QueryPerformanceCounter on Windows) —
+ * this advances only while the calling thread is actually scheduled on a CPU, so
+ * a descheduled/starved thread accrues (almost) none. Use it to budget work
+ * against real CPU consumed rather than wall-clock, which a contended host
+ * inflates without the thread doing any work. POSIX (incl. macOS 10.12+):
+ * CLOCK_THREAD_CPUTIME_ID. Windows: GetThreadTimes kernel+user. Returns 0 if the
+ * platform clock is unavailable. Implemented in compat.c. */
+uint64_t cbm_thread_cpu_time_ns(void);
+
 /* ── gmtime_r (Windows lacks it) ─────────────────────────────── */
 #ifdef _WIN32
 static inline struct tm *cbm_gmtime_r(const time_t *timep, struct tm *result) {
@@ -109,18 +131,74 @@ char *cbm_mkdtemp(char *tmpl);
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl);
+
 #else
 #define cbm_mkstemp mkstemp
 #endif
+
+/* Rewrite an absolute path into the form the platform's file APIs accept at
+ * any length. On Windows, absolute drive paths beyond the legacy 260-char
+ * limit are canonicalized and given the extended-length \\?\ prefix
+ * (SQLite passes such UTF-8 paths through to CreateFileW unchanged). On
+ * POSIX, the path is copied verbatim. Returns false if the buffer is too
+ * small or the path cannot be canonicalized. */
+bool cbm_path_for_file_api(const char *path, char *out, size_t out_size);
 
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */
 #ifdef _WIN32
 static inline int cbm_setenv(const char *name, const char *value, int overwrite) {
     (void)overwrite;
-    return _putenv_s(name, value);
+    if (!name || !value) {
+        return EINVAL;
+    }
+    int name_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, NULL, 0);
+    int value_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
+    wchar_t *wide_name =
+        name_chars > 0 ? (wchar_t *)malloc((size_t)name_chars * sizeof(*wide_name)) : NULL;
+    wchar_t *wide_value =
+        value_chars > 0 ? (wchar_t *)malloc((size_t)value_chars * sizeof(*wide_value)) : NULL;
+    bool converted =
+        wide_name && wide_value &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wide_name, name_chars) > 0 &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide_value, value_chars) > 0;
+    if (!converted) {
+        free(wide_name);
+        free(wide_value);
+        return EINVAL;
+    }
+    /* Keep the CRT's narrow environment useful for legacy getenv callers,
+     * then repair the process-wide Windows environment with the actual UTF-16
+     * value. _putenv_s alone routes UTF-8 path bytes through the active ANSI
+     * code page, which corrupts non-ASCII cache roots inherited by children. */
+    int status = _putenv_s(name, value);
+    if (status == 0 && !SetEnvironmentVariableW(wide_name, wide_value)) {
+        status = EINVAL;
+    }
+    free(wide_name);
+    free(wide_value);
+    return status;
 }
 static inline int cbm_unsetenv(const char *name) {
-    return _putenv_s(name, "");
+    if (!name) {
+        return EINVAL;
+    }
+    int name_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, NULL, 0);
+    wchar_t *wide_name =
+        name_chars > 0 ? (wchar_t *)malloc((size_t)name_chars * sizeof(*wide_name)) : NULL;
+    if (!wide_name ||
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wide_name, name_chars) <= 0) {
+        free(wide_name);
+        return EINVAL;
+    }
+    int status = _putenv_s(name, "");
+    if (status == 0) {
+        SetLastError(ERROR_SUCCESS);
+        if (!SetEnvironmentVariableW(wide_name, NULL) && GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+            status = EINVAL;
+        }
+    }
+    free(wide_name);
+    return status;
 }
 #else
 #define cbm_setenv setenv

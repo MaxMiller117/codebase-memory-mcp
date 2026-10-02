@@ -24,8 +24,11 @@
 #ifndef CBM_SEMANTIC_H
 #define CBM_SEMANTIC_H
 
+#include <stddef.h> /* size_t */
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "semantic/rotsq.h"
 
 /* ── Configuration ───────────────────────────────────────────────── */
 
@@ -38,6 +41,16 @@ enum { CBM_SEM_SPARSE_NNZE = 8 };
 
 /* Co-occurrence window half-width. */
 enum { CBM_SEM_WINDOW = 5 };
+
+/* Frequent-token subsampling cap for co-occurrence enrichment. Code token
+ * frequencies are Zipfian — a handful of tokens (int, static, return, …) occur
+ * in 10^4–10^5 functions and dominate the O(occurrences × window × dim) corpus
+ * finalize cost. When a token has more than this many occurrences, we stride-
+ * sample down to ~this count: the enriched vector is L2-normalized afterward, so
+ * an evenly-spaced subsample preserves its *direction* while bounding the work.
+ * Rare/high-IDF (discriminative) tokens fall under the cap and are untouched.
+ * Mirrors word2vec/GloVe frequent-word subsampling. */
+enum { CBM_SEM_MAX_OCCUR = 512 };
 
 /* Default score threshold for SEMANTICALLY_RELATED edge emission.
  * 0.75 balances recall with precision: validated ~95% precision on
@@ -124,10 +137,15 @@ typedef struct {
     int tfidf_len;
 
     /* Dense vectors for RI, API, Type, Decorator. */
-    cbm_sem_vec_t ri_vec;
-    cbm_sem_vec_t api_vec;
-    cbm_sem_vec_t type_vec;
-    cbm_sem_vec_t deco_vec;
+    /* Quantized semantic vectors (rotated 4-bit scalar quantization — see
+     * rotsq.h). The dense 768-float versions exist only transiently in the
+     * build workers: 4 x 3 KB resident floats per function were ~9.4 GB on
+     * the linux kernel; the codes are ~0.5 KB each. Scoring uses the exact
+     * code-expansion inner-product estimator (deterministic). */
+    cbm_rsq_code_t ri_code;
+    cbm_rsq_code_t api_code;
+    cbm_rsq_code_t type_code;
+    cbm_rsq_code_t deco_code;
 
     /* AST profile as float vector (decoded from "sp" property). */
     float struct_profile[CBM_SEM_AST_PROFILE_DIMS];
@@ -149,11 +167,13 @@ cbm_sem_corpus_t *cbm_sem_corpus_new(void);
 void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count);
 
 /* Batch-build the corpus from pre-tokenized documents (PARALLEL variant).
- * `all_tokens` layout: all_tokens[f * max_tokens_per_doc + t] = token pointer.
- * `token_counts[f]` = number of tokens in document f.
+ * Document f's tokens are all_tokens[offsets[f] .. offsets[f] + token_counts[f]).
+ * Packed, not strided: a fixed CBM_SEM_MAX_TOKENS (512) slots per document
+ * was 4 KB per function up front -- 7.4 GB on the kernel for tokens that
+ * average a few dozen per function.
  * This replaces a loop of cbm_sem_corpus_add_doc() calls. */
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc);
+                                   const size_t *offsets, const int *token_counts, int doc_count);
 
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);

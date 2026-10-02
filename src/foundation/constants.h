@@ -68,6 +68,14 @@ enum {
     CBM_INIT_DONE = 1,  /* initialization flag */
 };
 
+/* ── Default pagination limits ───────────────────────────────── */
+/* Default page size for search_graph and the underlying store-layer search.
+ * Responses land in an LLM agent's context window, so the default favors a
+ * cheap first page (~50 TOON rows ≈ 1.5K tokens) over raw coverage; the
+ * response always carries 'total' and 'has_more', and agents page via
+ * offset+limit or narrow with label/file_pattern when has_more is true. */
+enum { CBM_DEFAULT_SEARCH_LIMIT = 50 };
+
 /* ── Time conversion factors ─────────────────────────────────── */
 #define CBM_NSEC_PER_SEC 1000000000ULL
 #define CBM_USEC_PER_SEC 1000000ULL
@@ -85,5 +93,23 @@ enum {
 
 /* Common offset constants (used across many files). */
 enum { SKIP_ONE = 1, PAIR_LEN = 2 };
+
+/* ── Label allowlists for SQL ────────────────────────────────────
+ * SQL mirror of cbm_label_is_type_like() (internal/cbm/helpers.c). That
+ * function is documented as the single source of truth for type-like labels
+ * "instead of scattering `|| strcmp(label,\"Struct\")==0` across the tree" —
+ * but a SQL string literal cannot call it, so several queries hardcoded
+ * ('Function','Method','Class') and silently stopped matching the moment
+ * Struct/Interface/Enum/Type/Trait began being emitted.
+ *
+ * Use these instead of inlining a label list. tests/test_store_nodes.c pins
+ * them against cbm_label_is_type_like(), so adding a type-like label there
+ * without updating these fails CI rather than quietly shrinking query results. */
+#define CBM_SQL_TYPE_LIKE_LABELS "'Class','Struct','Interface','Enum','Type','Trait'"
+#define CBM_SQL_CALLABLE_LABELS "'Function','Method'"
+#define CBM_SQL_CALLABLE_OR_TYPE_LABELS CBM_SQL_CALLABLE_LABELS "," CBM_SQL_TYPE_LIKE_LABELS
+/* SQL mirror of cbm_label_is_relation() (Table/View/Model — data-lineage
+ * nodes), pinned by tests/test_store_nodes.c the same way as the sets above. */
+#define CBM_SQL_RELATION_LABELS "'Table','View','Model'"
 
 #endif /* CBM_CONSTANTS_H */

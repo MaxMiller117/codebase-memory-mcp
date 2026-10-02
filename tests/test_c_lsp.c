@@ -20,6 +20,17 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
+#include "lsp/cs_lsp.h"
+#include "lsp/ts_lsp.h"
+#include "lsp/go_lsp.h"
+#include "lsp/type_registry.h"
+#include "../src/pipeline/lsp_resolve.h"
+#include "arena.h"
+#include "preprocessor.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ── Helpers (same as test_go_lsp.c) ───────────────────────────── */
 
@@ -51,6 +62,13 @@ static CBMFileResult *extract_c(const char *src) {
 
 static CBMFileResult *extract_cpp(const char *src) {
     return cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "test", "main.cpp", 0, NULL, NULL);
+}
+
+static CBMFileResult *extract_c_family(const char *src, CBMLanguage language) {
+    const char *path = language == CBM_LANG_C      ? "main.c"
+                       : language == CBM_LANG_CUDA ? "main.cu"
+                                                   : "main.cpp";
+    return cbm_extract_file(src, (int)strlen(src), language, "test", path, 0, NULL, NULL);
 }
 
 TEST(clsp_simple_var_decl) {
@@ -535,6 +553,114 @@ TEST(clsp_nocrash_template_expression) {
                                    "    const char* s = \"hello\";\n"
                                    "}\n"
                                    "");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(clsp_nocrash_template_extra_call_args) {
+    CBMFileResult *r = extract_cpp("\n"
+                                   "class Widget {\n"
+                                   "public:\n"
+                                   "    void render() {}\n"
+                                   "};\n"
+                                   "\n"
+                                   "template<class T>\n"
+                                   "void invoke(T item) {\n"
+                                   "    item.render();\n"
+                                   "}\n"
+                                   "\n"
+                                   "void test() {\n"
+                                   "    Widget w;\n"
+                                   "    invoke(w, 1, 2);\n"
+                                   "}\n"
+                                   "");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(clsp_nocrash_template_function_multi_param_nested_call) {
+    CBMFileResult *r = extract_cpp(
+        "\n"
+        "void right_aligned_text(int color, int width, const char* fmt, float value) {}\n"
+        "\n"
+        "template<typename T, typename R = float>\n"
+        "R format_units(T value, const char*& unit) { return value; }\n"
+        "\n"
+        "void f() {\n"
+        "    const char* unit = nullptr;\n"
+        "    right_aligned_text(0, 0, \"%.1f\", format_units(1, unit));\n"
+        "}\n"
+        "");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "f", "right_aligned_text"), 0);
+    ASSERT_GTE(find_resolved(r, "f", "format_units"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #220: C++ CALLS edges were attributed to the Module (file) node
+ * instead of the enclosing Function/Method, breaking function-level
+ * trace_path. The resolved call's caller_qn must be the enclosing function. */
+TEST(clsp_calls_attributed_to_function_issue220) {
+    CBMFileResult *r = extract_cpp("void helper() {}\n"
+                                   "void doWork() {\n"
+                                   "    helper();\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    int idx = find_resolved(r, "doWork", "helper");
+    ASSERT_GTE(idx, 0);
+    ASSERT_NOT_NULL(strstr(r->resolved_calls.items[idx].caller_qn, "doWork"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #355: indexing segfaulted while extracting a heavily-macro'd xxhash
+ * C header (`dhw/xx_hash.h`). The reporter's exact file isn't available, so
+ * this drives the vendored xxhash.h (~7.5k lines, same macro-dense family)
+ * through C extraction as a proxy/regression guard. Runs under ASan. */
+TEST(clsp_nocrash_issue355_xxhash_header) {
+    FILE *fp = fopen("vendored/xxhash/xxhash.h", "rb");
+    if (!fp) {
+        FAIL("vendored/xxhash/xxhash.h not found (run from repo root)");
+    }
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (n <= 0) {
+        fclose(fp);
+        FAIL("xxhash.h unreadable");
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(fp);
+        FAIL("oom");
+    }
+    size_t rd = fread(buf, 1, (size_t)n, fp);
+    fclose(fp);
+    buf[rd] = '\0';
+    CBMFileResult *r =
+        cbm_extract_file(buf, (int)rd, CBM_LANG_C, "test", "xxhash.h", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    free(buf);
+    PASS();
+}
+
+/* Issue #312: indexing segfaulted in pass=definitions on a function template
+ * with a defaulted type param AND an `auto` parameter, called with matching
+ * arg count. The defaulted/unbound template param `U` flowed through type
+ * substitution as NULL and was dereferenced during return-type handling. */
+TEST(clsp_nocrash_issue312_default_template_auto_param) {
+    CBMFileResult *r = extract_cpp("template<typename T, typename U = int>\n"
+                                   "U f(auto, T t) {\n"
+                                   "    return t;\n"
+                                   "}\n"
+                                   "\n"
+                                   "int main() {\n"
+                                   "    if (f(1, 2) != 2) return 1;\n"
+                                   "}\n");
     ASSERT_NOT_NULL(r);
     cbm_free_result(r);
     PASS();
@@ -6251,7 +6377,10 @@ TEST(clsp_cross_gap_new_then_method_chain) {
     ASSERT_GTE(find_resolved(r, "test", "Service.Service"), 0);
     ASSERT_GTE(find_resolved(r, "test", "start"), 0);
     ASSERT_GTE(find_resolved(r, "test", "stop"), 0);
-    ASSERT_GTE(find_resolved(r, "test", "~Service"), 0);
+    /* Service declares no destructor node. Explicit delete retains its
+     * semantic-only carrier, but the resolver must not fabricate an implicit
+     * ~Service target that the graph cannot materialize. */
+    ASSERT_EQ(find_resolved(r, "test", "~Service"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -7176,7 +7305,10 @@ TEST(clsp_pattern_auto_ptr_from_new) {
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(find_resolved(r, "test", "draw"), 0);
     ASSERT_GTE(find_resolved(r, "test", "Widget.Widget"), 0);
-    ASSERT_GTE(find_resolved(r, "test", "~Widget"), 0);
+    /* Widget has only an implicit destructor, so delete cannot resolve to a
+     * concrete graph target. A declared ~Widget is covered by the dedicated
+     * explicit-destructor test. */
+    ASSERT_EQ(find_resolved(r, "test", "~Widget"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -7663,11 +7795,13 @@ TEST(clsp_fix2_struct_field_access_pair_second) {
                                    "}\n"
                                    "");
     ASSERT_NOT_NULL(r);
-    /* KNOWN ISSUE: template field type resolution fails under ASan due to
-     * a stack-pointer-to-registry leak bug in c_lsp.c. The Go test passes
-     * because CGo doesn't run ASan/UBSan. See c_lsp_process_file's
-     * no_sanitize("address") attribute. Tracked as a pre-existing C LSP bug. */
-    (void)find_resolved(r, "test", "bar");
+    /* Formerly a KNOWN ISSUE: template field type resolution failed under
+     * ASan due to a stack-pointer-to-registry lifetime bug, hidden by a
+     * whole-function no_sanitize("address") on c_lsp_process_file and a
+     * discarded assertion here. The suppression is removed and the branch's
+     * C LSP registry rework resolved the lifetime; this now asserts the
+     * resolution it always meant to. */
+    ASSERT_GTE(find_resolved(r, "test", "bar"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -14932,8 +15066,9 @@ TEST(clsp_easy_win_sfinaevoid_t) {
     PASS();
 }
 
-/* DLL resolve LSP tests removed — string literals triggered
- * Windows Defender false positive. See issue #89. */
+/* DLL resolve LSP tests removed after the associated builds received a
+ * Windows Defender verdict. The opaque verdict did not prove which feature
+ * caused it; see issue #89 for the historical observation. */
 
 TEST(clsp_dll_custom_resolver) {
     CBMFileResult *r = extract_c("\n"
@@ -15073,9 +15208,1182 @@ TEST(clsp_easy_win_sfinaeconditional_return) {
     PASS();
 }
 
+/* Reproduce-first guard for the Linux-kernel full-index O(n^2) hang.
+ *
+ * In `full` mode the pipeline builds ONE project-wide C cross-registry
+ * (cbm_c_build_cross_registry), FINALIZES it (O(1) hash lookups), then shares it
+ * READ-ONLY across the parallel resolve workers (ctx.registry_shared = true).
+ * cbm_run_c_lsp_cross_with_registry must therefore NOT mutate it.
+ *
+ * Bug: c_lsp.c:4323 (and 4628/4201/4426) ignore registry_shared and add_func into
+ * the shared, already-finalized registry. Each post-finalize add lands in a tail
+ * the hash index does not cover, so lookup_func_self/lookup_method_self linear-scan
+ * that ever-growing tail on every lookup (type_registry.c:280-286, 186-195). Across
+ * 89k kernel files doing millions of lookups => O(files * defs) (the >6-min hang),
+ * plus an 11-thread heap race (c_lsp.c:4146-4152 warns of the SIGSEGV).
+ *
+ * INVARIANT (green <=> fixed): resolve leaves the finalized shared registry's
+ * func_count/type_count unchanged. RED on the unguarded code; GREEN once every
+ * mutation site honors !registry_shared. */
+TEST(clsp_tier2_shared_registry_readonly_c) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    /* stdlib-only project registry, finalized inside the builder */
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int funcs_before = reg->func_count;
+    int types_before = reg->type_count;
+    /* A C translation unit defining functions absent from the shared registry; a
+     * correct read-only resolve must not register them into it. */
+    const char *src = "struct Node { int v; };\n"
+                      "struct Node *make_node(int v);\n"
+                      "int helper(int x) { return x + 1; }\n"
+                      "int caller(void) { return helper(make_node(7)->v); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/false, reg, /*include_paths=*/NULL,
+                                      /*include_ns_qns=*/NULL, /*include_count=*/0,
+                                      /*cached_tree=*/NULL, &out);
+    ASSERT_EQ(reg->func_count, funcs_before);
+    ASSERT_EQ(reg->type_count, types_before);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The method-return refinement in the C++ class walk used to cast the chained
+ * lookup result and write a scratch-arena signature into it. With the entry in
+ * the sealed shared base, every other worker read that signature after the
+ * arena of this file had died (ASan heap-use-after-free in c_adl_resolve on
+ * dotnet/runtime, 2026-09-14). Contract: the refinement is copy-on-write into
+ * the overlay; the base signature pointer never changes. min_params = 7 is a
+ * marker only a COPY of the base entry carries (a fresh registration sets -1),
+ * so the assertion proves the upgrade path ran, not a re-registration. */
+TEST(clsp_method_return_refinement_is_copy_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    const CBMType *rets[2] = {cbm_type_named(&arena, "test.mod.Item"), NULL};
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "test.mod.Box.items";
+    f.short_name = "items";
+    f.receiver_type = "test.mod.Box";
+    f.signature = cbm_type_func(&arena, NULL, NULL, rets);
+    f.min_params = 7;
+    cbm_registry_add_func(&base, f);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+    const CBMRegisteredFunc *base_entry = cbm_registry_lookup_func(&base, "test.mod.Box.items");
+    ASSERT_NOT_NULL(base_entry);
+    const CBMType *base_sig = base_entry->signature;
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+    /* The in-class declaration refines the NAMED return to a POINTER. */
+    const char *src = "struct Item { int v; };\n"
+                      "struct Box {\n"
+                      "    Item *items();\n"
+                      "};\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&scratch, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, &overlay, NULL, NULL, 0, NULL, &out);
+
+    ASSERT(base_entry->signature == base_sig);
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+    const CBMRegisteredFunc *refined = cbm_registry_lookup_func(&overlay, "test.mod.Box.items");
+    ASSERT_NOT_NULL(refined);
+    ASSERT(refined >= overlay.funcs && refined < overlay.funcs + overlay.func_count);
+    ASSERT_EQ(refined->min_params, 7);
+    ASSERT_EQ(refined->signature->data.func.return_types[0]->kind, CBM_TYPE_POINTER);
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The per-file overlay contract (type_registry.c chain API): a walk is handed
+ * an overlay chained to a sealed base. Lookups and iterators see the base
+ * through the overlay, every yielded index belongs to it.reg, a refinement is
+ * copy-on-write into the overlay (the base never changes), and an overlay copy
+ * shadows its base original in chained iteration. */
+TEST(registry_overlay_chain_iterates_and_copies_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.alpha";
+    f.short_name = "alpha";
+    f.min_params = -1;
+    cbm_registry_add_func(&base, f);
+    f.qualified_name = "pkg.beta";
+    f.short_name = "beta";
+    cbm_registry_add_func(&base, f);
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.T";
+    t.short_name = "T";
+    cbm_registry_add_type(&base, t);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+
+    /* Lookups chain through the empty overlay. */
+    ASSERT_NOT_NULL(cbm_registry_lookup_func(&overlay, "pkg.alpha"));
+    ASSERT_NOT_NULL(cbm_registry_lookup_type(&overlay, "pkg.T"));
+
+    /* Chained iteration reaches the base; it.reg names where the index lives. */
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int i = cbm_free_func_iter_next(&it);
+    ASSERT(i >= 0);
+    ASSERT(it.reg == &base);
+    ASSERT(strcmp(it.reg->funcs[i].qualified_name, "pkg.alpha") == 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+    /* The plain iterator on the overlay alone sees nothing -- unchanged. */
+    cbm_registry_free_funcs_by_short_name(&overlay, "alpha", &it);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+
+    /* Copy-on-write: the refinement lands in the overlay, the base is untouched,
+     * and chained lookup now returns the refined copy. */
+    CBMRegisteredFunc *w = cbm_registry_func_for_update(&overlay, "pkg.alpha");
+    ASSERT_NOT_NULL(w);
+    ASSERT(w >= overlay.funcs && w < overlay.funcs + overlay.func_count);
+    w->min_params = 2;
+    ASSERT_EQ(base.funcs[0].min_params, -1);
+    ASSERT_EQ(cbm_registry_lookup_func(&overlay, "pkg.alpha")->min_params, 2);
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.alpha") ==
+           w); /* own entry, no second copy */
+    ASSERT_EQ(overlay.func_count, 1);
+
+    /* The base original is shadowed: chained iteration yields exactly one alpha,
+     * from the overlay. */
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        ASSERT(it.reg == &overlay);
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+    /* Linear chain over everything: alpha (overlay copy) + beta (base). */
+    cbm_registry_all_funcs_chain(&overlay, &it);
+    seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 2);
+
+    /* Types: same contract. */
+    CBMTypeShortIter ti;
+    cbm_registry_types_by_short_name_chain(&overlay, "T", &ti);
+    int k = cbm_type_short_iter_next(&ti);
+    ASSERT(k >= 0);
+    ASSERT(ti.reg == &base);
+    CBMRegisteredType *wt = cbm_registry_type_for_update(&overlay, "pkg.T");
+    ASSERT_NOT_NULL(wt);
+    ASSERT_EQ(overlay.type_count, 1);
+    cbm_registry_all_types_chain(&overlay, &ti);
+    seen = 0;
+    while (cbm_type_short_iter_next(&ti) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+
+    /* A sealed head refuses refinement; an unknown QN yields nothing. */
+    overlay.read_only = true;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.beta") == NULL);
+    overlay.read_only = false;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.nope") == NULL);
+    ASSERT_EQ(base.func_count, 2);
+
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Direct guard for the type-name / embedded-type / free-function registry
+ * indexes and their iterators (type_registry.c). Verifies that every iterator
+ * preserves ascending registry order, which is part of resolver tie-breaking. */
+TEST(registry_short_name_indexes) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+
+    /* type 0: Trait (no embeds). type 1: A impl "pkg.Trait". type 2: B impl bare
+     * "Trait" AND a second embed also bare "Trait" (dedup case). type 3: C impl
+     * "pkg.Other". */
+    const char *a_emb[] = {"pkg.Trait", NULL};
+    const char *b_emb[] = {"other.Trait", "misc.Trait", NULL}; /* two entries, bare "Trait" */
+    const char *c_emb[] = {"pkg.Other", NULL};
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.A";
+    t.short_name = "A";
+    t.embedded_types = a_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.B";
+    t.short_name = "B";
+    t.embedded_types = b_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.C";
+    t.short_name = "C";
+    t.embedded_types = c_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "other.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+
+    /* Populate enough distinct names to force many hash-bucket collisions, with
+     * repeated short names spread across the registry. The differential check
+     * below compares the index against the exact former linear-scan order. */
+    for (int i = 0; i < 512; i++) {
+        memset(&t, 0, sizeof(t));
+        t.qualified_name = cbm_arena_sprintf(&arena, "bulk.mod%d.Name%d", i, i % 23);
+        ASSERT_NOT_NULL(t.qualified_name);
+        t.short_name = strrchr(t.qualified_name, '.') + 1;
+        cbm_registry_add_type(&reg, t);
+    }
+
+    /* free func "helper" (x2 — different QNs), method "M.helper", free func "other". */
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.helper";
+    f.short_name = "helper";
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.sub.helper";
+    f.short_name = "helper";
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.M.helper";
+    f.short_name = "helper";
+    f.receiver_type = "pkg.M"; /* method — must NOT appear in the free-func index */
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.other";
+    f.short_name = "other";
+    cbm_registry_add_func(&reg, f);
+
+    cbm_registry_finalize(&reg);
+    cbm_registry_build_type_short_index(&reg);
+
+    /* Qualified-name bare segment "Trait": types 0, 4, then the bare-QN type
+     * 5. The iterator is a hash prefilter, so apply the exact predicate before
+     * asserting its order just like production consumers do. */
+    CBMTypeShortIter nit;
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    {
+        int expected[] = {0, 4, 5};
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+                continue;
+            ASSERT_TRUE(exact_count < 3);
+            ASSERT_EQ(candidate, expected[exact_count++]);
+        }
+        ASSERT_EQ(exact_count, 3);
+    }
+    cbm_registry_types_by_short_name(&reg, "Missing", &nit);
+    {
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (candidate_short && strcmp(candidate_short, "Missing") == 0)
+                exact_count++;
+        }
+        ASSERT_EQ(exact_count, 0);
+    }
+
+    for (int name_i = 0; name_i < 23; name_i++) {
+        char short_name[32];
+        snprintf(short_name, sizeof(short_name), "Name%d", name_i);
+        cbm_registry_types_by_short_name(&reg, short_name, &nit);
+        int linear_i = 0;
+        for (;;) {
+            int expected = -1;
+            while (linear_i < reg.type_count) {
+                int candidate = linear_i++;
+                const char *qn = reg.types[candidate].qualified_name;
+                const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+                const char *candidate_short = last_dot ? last_dot + 1 : qn;
+                if (candidate_short && strcmp(candidate_short, short_name) == 0) {
+                    expected = candidate;
+                    break;
+                }
+            }
+
+            int actual;
+            for (;;) {
+                actual = cbm_type_short_iter_next(&nit);
+                if (actual < 0)
+                    break;
+                const char *qn = reg.types[actual].qualified_name;
+                const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+                const char *candidate_short = last_dot ? last_dot + 1 : qn;
+                if (candidate_short && strcmp(candidate_short, short_name) == 0)
+                    break;
+            }
+
+            ASSERT_EQ(actual, expected);
+            if (expected < 0)
+                break;
+        }
+    }
+
+    /* Embed index for bare "Trait": types 1 (A) then 2 (B), ascending, B once. */
+    CBMTypeEmbedIter it;
+    cbm_registry_types_by_embedded_bare(&reg, "Trait", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 1);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 2);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Bare "Other": only type 3 (C). */
+    cbm_registry_types_by_embedded_bare(&reg, "Other", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 3);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Bare with no implementers: empty. */
+    cbm_registry_types_by_embedded_bare(&reg, "Nope", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Free-func index for "helper": func 0 then 1 (ascending), NOT the method (2). */
+    CBMFreeFuncIter fit;
+    cbm_registry_free_funcs_by_short_name(&reg, "helper", &fit);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 1);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    /* Free-func "other": only func 3. */
+    cbm_registry_free_funcs_by_short_name(&reg, "other", &fit);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 3);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    /* A type appended after finalize is covered by the iterator tail. If the
+     * auxiliary allocation is unavailable, the iterator falls back to the same
+     * complete linear scan rather than silently dropping candidates. Keep this
+     * after the other iterator assertions because their tails intentionally
+     * expose post-finalize candidates for caller-side exact filtering too. */
+    int tail_type_i = reg.type_count;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "tail.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 0);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 4);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 5);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), tail_type_i);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), -1);
+
+    int *saved_type_short_buckets = reg.type_short_buckets;
+    reg.type_short_buckets = NULL;
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    int fallback_expected[] = {0, 4, 5, tail_type_i};
+    int fallback_count = 0;
+    int candidate;
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
+    reg.type_short_buckets = saved_type_short_buckets;
+
+    /* A failed rebuild must discard the previous auxiliary index. Re-finalize
+     * after adding the tail type so the QN boundary advances, then force arena
+     * exhaustion for the optional rebuild. The iterator must fall back to the
+     * complete linear scan instead of retaining the stale pre-tail index. */
+    cbm_registry_finalize(&reg);
+    int saved_nblocks = arena.nblocks;
+    size_t saved_used = arena.used;
+    arena.nblocks = CBM_ARENA_MAX_BLOCKS;
+    arena.used = arena.block_size;
+    cbm_registry_build_type_short_index(&reg);
+    arena.nblocks = saved_nblocks;
+    arena.used = saved_used;
+    ASSERT_NULL(reg.type_short_buckets);
+    ASSERT_NULL(reg.type_short_entries);
+    ASSERT_EQ(reg.type_short_bucket_count, 0);
+
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    fallback_count = 0;
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* C++ sibling guard: the same shared-registry read-only invariant for the
+ * C++-only mutation sites — method registration (c_lsp.c:4760), template
+ * type-param scan (4558), default-arg min_params scan (4333). RED while those
+ * sites ignore registry_shared; GREEN once guarded. (Latent O(n^2)+race for large
+ * C++ codebases like LLVM/bitcoin — not the kernel, which is C.) */
+TEST(clsp_tier2_shared_registry_readonly_cpp) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int funcs_before = reg->func_count;
+    int types_before = reg->type_count;
+    const char *src = "template <typename T> struct Holder { T get(); };\n"
+                      "struct Box { int unwrap(); };\n"
+                      "int Box::unwrap() { return 0; }\n"
+                      "int with_default(int a, int b = 2) { return a + b; }\n"
+                      "int caller(Box *b) { return b->unwrap() + with_default(1); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, reg, /*include_paths=*/NULL,
+                                      /*include_ns_qns=*/NULL, /*include_count=*/0,
+                                      /*cached_tree=*/NULL, &out);
+    ASSERT_EQ(reg->func_count, funcs_before);
+    ASSERT_EQ(reg->type_count, types_before);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Cross-language check of the same Tier-2 shared-registry read-only invariant for
+ * the other languages that build a shared cross-registry (py, c#, ts, go). The
+ * registry-level seal (type_registry.c: add_func/_type no-op when reg->read_only)
+ * guards all of them at one chokepoint. Each test: build+finalize the shared
+ * registry, resolve a source, assert func_count/type_count are unchanged. (TS
+ * deliberately mutates a per-file OVERLAY chained to the base — the base must
+ * still be untouched.) */
+TEST(seal_py_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "def helper(x):\n    return x + 1\n\ndef caller():\n    return helper(1)\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out, NULL);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Sibling of seal_py_shared_registry_readonly at the FIELD-ARRAY granularity.
+ *
+ * The count-based seal tests only catch mutations routed through
+ * cbm_registry_add_func/_type (which the read_only seal no-ops). But
+ * py_register_instance_field (py_lsp.c:495), invoked from the `self.x = ...`
+ * assignment handler (py_lsp.c:1616), writes the registered type's
+ * field_names/field_types arrays DIRECTLY (py_lsp.c:517 in-place; :543-544 pointer
+ * reassign) with NO read_only guard — bypassing the seal. In the fused parallel
+ * resolve path pass_parallel.c:2726 hands EVERY worker the one shared, finalized,
+ * read_only registry (pipeline.c:901 → cbm_py_build_cross_registry), so this is a
+ * cross-thread data race AND a cross-file dangling pointer (the appended arrays are
+ * allocated in the per-file resolve arena, freed when that file completes) into a
+ * sealed registry. func_count/type_count stay put, which is exactly why the sibling
+ * test above stays green while the bug persists.
+ *
+ * INVARIANT (green <=> fixed): resolving a `self.x = ...` method body against the
+ * sealed shared registry leaves the class's field arrays byte-identical. RED today
+ * (new field "x" is appended → field_names pointer + count both change); GREEN once
+ * py_register_instance_field honors ctx->registry->read_only. */
+TEST(seal_py_shared_registry_readonly_fields) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    /* One Python class Foo (+ method m) so the shared registry holds a type
+     * "test.mod.Foo" that resolve's self.x= handler will target. */
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.mod.Foo";
+    defs[0].short_name = "Foo";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.mod.Foo.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.Foo";
+    defs[1].def_module_qn = "test.mod";
+    defs[1].lang = CBM_LANG_PYTHON;
+
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    /* Snapshot Foo's field arrays before resolve. The entry is stable across
+     * resolve: read_only blocks add_type, so reg->types is never reallocated. */
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, "test.mod.Foo");
+    ASSERT_NOT_NULL(rt);
+    const char **names_before = rt->field_names;
+    int count_before = 0;
+    if (rt->field_names)
+        while (rt->field_names[count_before])
+            count_before++;
+
+    /* A method assigning a NEW instance field on self → the buggy code appends
+     * "x" directly into the sealed registry entry. */
+    const char *src = "class Foo:\n"
+                      "    def m(self):\n"
+                      "        self.x = 1\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out, NULL);
+
+    /* The sealed registry entry must be untouched by resolve. */
+    int count_after = 0;
+    if (rt->field_names)
+        while (rt->field_names[count_after])
+            count_after++;
+    ASSERT_EQ(count_after, count_before);
+    ASSERT_TRUE(rt->field_names == names_before);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(seal_cs_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_cs_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "namespace N { class Box { int Unwrap() { return 0; }\n"
+                      "  int Caller() { return Unwrap(); } } }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_cs_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, 0,
+                                       NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(seal_ts_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "class Box { unwrap(): number { return 0; } }\n"
+                      "function caller(b: Box): number { return b.unwrap(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", false, false,
+                                       false, reg, NULL, 0, NULL, NULL, 0, NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(seal_go_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_go_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "package main\nfunc helper(x int) int { return x + 1 }\n"
+                      "func caller() int { return helper(1) }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_go_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+static int assert_cpp_family_repeated_method_occurrences(CBMLanguage language) {
+    static const char source[] = "struct Alpha { int render() { return 1; } };\n"
+                                 "struct Bravo { int render() { return 2; } };\n"
+                                 "int occurrence_probe() {\n"
+                                 "    Alpha alpha;\n"
+                                 "    Bravo bravo;\n"
+                                 "    return alpha.render() + bravo.render();\n"
+                                 "}\n";
+    static const char *call_texts[2] = {"alpha.render()", "bravo.render()"};
+    const char *sites[2] = {strstr(source, call_texts[0]), strstr(source, call_texts[1])};
+    ASSERT_NOT_NULL(sites[0]);
+    ASSERT_NOT_NULL(sites[1]);
+    uint32_t starts[2] = {(uint32_t)(sites[0] - source), (uint32_t)(sites[1] - source)};
+    uint32_t ends[2] = {starts[0] + (uint32_t)strlen(call_texts[0]),
+                        starts[1] + (uint32_t)strlen(call_texts[1])};
+
+    CBMFileResult *result = extract_c_family(source, language);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *calls[2] = {NULL, NULL};
+    const CBMResolvedCall *semantics[2] = {NULL, NULL};
+    int carrier_count = 0;
+    int semantic_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrence_probe") ||
+            !call->callee_name || strcmp(cbm_lsp_bare_segment(call->callee_name), "render") != 0) {
+            continue;
+        }
+        carrier_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (call->site_start_byte == starts[occurrence] &&
+                call->site_end_byte == ends[occurrence]) {
+                calls[occurrence] = call;
+            }
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            !resolved->caller_qn || !strstr(resolved->caller_qn, "occurrence_probe") ||
+            !resolved->callee_qn ||
+            strcmp(cbm_lsp_bare_segment(resolved->callee_qn), "render") != 0) {
+            continue;
+        }
+        semantic_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (resolved->site_start_byte == starts[occurrence] &&
+                resolved->site_end_byte == ends[occurrence]) {
+                semantics[occurrence] = resolved;
+            }
+        }
+    }
+
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_NOT_NULL(calls[0]);
+    ASSERT_NOT_NULL(calls[1]);
+    ASSERT_NOT_NULL(semantics[0]);
+    ASSERT_NOT_NULL(semantics[1]);
+    ASSERT_NOT_NULL(strstr(semantics[0]->callee_qn, "Alpha.render"));
+    ASSERT_NOT_NULL(strstr(semantics[1]->callee_qn, "Bravo.render"));
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[0], false) ==
+                semantics[0]);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[1], false) ==
+                semantics[1]);
+    cbm_free_result(result);
+    return 0;
+}
+
+TEST(clsp_cpp_repeated_same_leaf_calls_join_exact_occurrences) {
+    return assert_cpp_family_repeated_method_occurrences(CBM_LANG_CPP);
+}
+
+TEST(clsp_cuda_repeated_same_leaf_calls_join_exact_occurrences) {
+    return assert_cpp_family_repeated_method_occurrences(CBM_LANG_CUDA);
+}
+
+TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences) {
+    static const char source[] = "static int alpha_target(void) { return 1; }\n"
+                                 "static int bravo_target(void) { return 2; }\n"
+                                 "int occurrence_probe(void) {\n"
+                                 "    int (*fp)(void) = alpha_target;\n"
+                                 "    int first = fp();\n"
+                                 "    fp = bravo_target;\n"
+                                 "    return first + fp();\n"
+                                 "}\n";
+    static const char call_text[] = "fp()";
+    const char *first_site = strstr(source, call_text);
+    const char *second_site = first_site ? strstr(first_site + 1, call_text) : NULL;
+    ASSERT_NOT_NULL(first_site);
+    ASSERT_NOT_NULL(second_site);
+    uint32_t starts[2] = {(uint32_t)(first_site - source), (uint32_t)(second_site - source)};
+    uint32_t ends[2] = {starts[0] + (uint32_t)strlen(call_text),
+                        starts[1] + (uint32_t)strlen(call_text)};
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *calls[2] = {NULL, NULL};
+    const CBMResolvedCall *semantics[2] = {NULL, NULL};
+    int carrier_count = 0;
+    int semantic_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrence_probe") ||
+            !call->callee_name || strcmp(call->callee_name, "fp") != 0) {
+            continue;
+        }
+        carrier_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (call->site_start_byte == starts[occurrence] &&
+                call->site_end_byte == ends[occurrence]) {
+                calls[occurrence] = call;
+            }
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            !resolved->caller_qn || !strstr(resolved->caller_qn, "occurrence_probe") ||
+            !resolved->reason || strcmp(resolved->reason, "fp") != 0) {
+            continue;
+        }
+        semantic_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (resolved->site_start_byte == starts[occurrence] &&
+                resolved->site_end_byte == ends[occurrence]) {
+                semantics[occurrence] = resolved;
+            }
+        }
+    }
+
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_NOT_NULL(calls[0]);
+    ASSERT_NOT_NULL(calls[1]);
+    ASSERT_NOT_NULL(semantics[0]);
+    ASSERT_NOT_NULL(semantics[1]);
+    ASSERT_NOT_NULL(strstr(semantics[0]->callee_qn, "alpha_target"));
+    ASSERT_NOT_NULL(strstr(semantics[1]->callee_qn, "bravo_target"));
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[0], false) ==
+                semantics[0]);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[1], false) ==
+                semantics[1]);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target) {
+    static const char source[] = "static int alpha_target(void) { return 1; }\n"
+                                 "static int bravo_target(void) { return 2; }\n"
+                                 "int occurrence_probe(void) {\n"
+                                 "    int (*fp)(void) = alpha_target;\n"
+                                 "    int inner = 0;\n"
+                                 "    {\n"
+                                 "        int (*fp)(void) = bravo_target;\n"
+                                 "        inner = fp();\n"
+                                 "    }\n"
+                                 "    return inner + fp();\n"
+                                 "}\n";
+    const char *inner_site = strstr(source, "fp();");
+    const char *outer_site = inner_site ? strstr(inner_site + 1, "fp();") : NULL;
+    ASSERT_NOT_NULL(inner_site);
+    ASSERT_NOT_NULL(outer_site);
+    uint32_t inner_start = (uint32_t)(inner_site - source);
+    uint32_t outer_start = (uint32_t)(outer_site - source);
+    uint32_t call_len = (uint32_t)strlen("fp()");
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMResolvedCall *inner_semantic = NULL;
+    const CBMResolvedCall *outer_semantic = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || !resolved->reason ||
+            strcmp(resolved->reason, "fp") != 0 || !resolved->callee_qn) {
+            continue;
+        }
+        if (resolved->site_start_byte == inner_start &&
+            resolved->site_end_byte == inner_start + call_len) {
+            inner_semantic = resolved;
+        }
+        if (resolved->site_start_byte == outer_start &&
+            resolved->site_end_byte == outer_start + call_len) {
+            outer_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(inner_semantic);
+    ASSERT_NOT_NULL(outer_semantic);
+    ASSERT_NOT_NULL(strstr(inner_semantic->callee_qn, "bravo_target"));
+    ASSERT_NOT_NULL(strstr(outer_semantic->callee_qn, "alpha_target"));
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_cpp_new_expression_joins_exact_occurrence) {
+    static const char source[] = "struct Widget { Widget() {} };\n"
+                                 "Widget* occurrence_probe() { return new Widget(); }\n";
+    const char *site = strstr(source, "new Widget()");
+    ASSERT_NOT_NULL(site);
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen("new Widget()");
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_CPP);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *carrier = NULL;
+    const CBMResolvedCall *semantic = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->site_start_byte == start && call->site_end_byte == end) {
+            carrier = call;
+            break;
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "Widget.Widget") && resolved->site_start_byte == start &&
+            resolved->site_end_byte == end) {
+            semantic = resolved;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(carrier);
+    ASSERT_NOT_NULL(semantic);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, carrier, false) ==
+                semantic);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_c_global_initializer_does_not_inherit_previous_function_caller) {
+    static const char source[] = "int helper(void) { return 1; }\n"
+                                 "void previous(void) {}\n"
+                                 "int global_value = helper();\n";
+    const char *site = strrchr(source, 'h');
+    ASSERT_NOT_NULL(site);
+    ASSERT_STR_EQ(site, "helper();\n");
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen("helper()");
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *carrier = NULL;
+    const CBMResolvedCall *semantic = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->site_start_byte == start && call->site_end_byte == end) {
+            carrier = call;
+            break;
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "helper") && resolved->site_start_byte == start &&
+            resolved->site_end_byte == end) {
+            semantic = resolved;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(carrier);
+    ASSERT_NOT_NULL(semantic);
+    ASSERT_STR_EQ(semantic->caller_qn, carrier->enclosing_func_qn);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, carrier, false) ==
+                semantic);
+    cbm_free_result(result);
+    PASS();
+}
+
+static int assert_cpp_family_preprocessed_collision_isolated(CBMLanguage language) {
+    /* simplecpp removes the 41-byte comment payload and normalizes tokens. As
+     * verified by the non-vacuity assertions below, raw alpha.render and the
+     * macro-hidden expanded bravo.render both land at numeric span 182:200,
+     * even though those offsets refer to different source texts. */
+    static const char source[] =
+        "struct Alpha { int render(){return 1;} };\n"
+        "struct Bravo { int render(){return 2;} };\n"
+        "int occurrence_probe(){\n"
+        " Alpha alpha; Bravo bravo;\n"
+        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ alpha . render ( );\n"
+        "#define HIDDEN_RENDER(x) x.render()\n"
+        " return HIDDEN_RENDER(bravo);\n"
+        "}\n";
+    const uint32_t collision_start = 182;
+    const uint32_t collision_end = 200;
+    ASSERT_EQ((uint32_t)(strstr(source, "alpha . render ( )") - source), collision_start);
+
+    CBMFileResult *result = extract_c_family(source, language);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *raw_alpha = NULL;
+    const CBMCall *expanded_bravo = NULL;
+    int colliding_carriers = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrence_probe") ||
+            call->site_start_byte != collision_start || call->site_end_byte != collision_end ||
+            !call->callee_name || !strstr(call->callee_name, "render")) {
+            continue;
+        }
+        colliding_carriers++;
+        if (strstr(call->callee_name, "alpha")) {
+            raw_alpha = call;
+        }
+        if (strstr(call->callee_name, "bravo")) {
+            expanded_bravo = call;
+        }
+    }
+    ASSERT_EQ(colliding_carriers, 2);
+    ASSERT_NOT_NULL(raw_alpha);
+    ASSERT_NOT_NULL(expanded_bravo);
+
+    const CBMResolvedCall *raw_alpha_semantic = NULL;
+    const CBMResolvedCall *expanded_bravo_semantic = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            resolved->site_start_byte != collision_start ||
+            resolved->site_end_byte != collision_end || !resolved->callee_qn) {
+            continue;
+        }
+        if (strstr(resolved->callee_qn, "Alpha.render")) {
+            raw_alpha_semantic = resolved;
+        }
+        if (strstr(resolved->callee_qn, "Bravo.render")) {
+            expanded_bravo_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(raw_alpha_semantic);
+    ASSERT_NOT_NULL(expanded_bravo_semantic);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, raw_alpha, false) ==
+                raw_alpha_semantic);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, expanded_bravo, false) ==
+                expanded_bravo_semantic);
+    cbm_free_result(result);
+    return 0;
+}
+
+TEST(clsp_cpp_preprocessed_coordinate_collision_isolated) {
+    return assert_cpp_family_preprocessed_collision_isolated(CBM_LANG_CPP);
+}
+
+TEST(clsp_cuda_preprocessed_coordinate_collision_isolated) {
+    return assert_cpp_family_preprocessed_collision_isolated(CBM_LANG_CUDA);
+}
+
+TEST(clsp_c_preprocessed_coordinate_collision_isolated) {
+    /* The raw fp call and macro-hidden expanded fp call both occupy 206:212,
+     * but data flow resolves them to different targets. */
+    static const char source[] =
+        "static int alpha_target(void){return 1;}\n"
+        "static int bravo_target(void){return 2;}\n"
+        "int occurrence_probe(void){\n"
+        " int (*fp)(void) = alpha_target;\n"
+        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ fp ( );\n"
+        "#define HIDDEN_FP_CALL() (fp = bravo_target, fp())\n"
+        " return HIDDEN_FP_CALL();\n"
+        "}\n";
+    const uint32_t collision_start = 206;
+    const uint32_t collision_end = 212;
+    const char *raw_probe = strstr(source, "occurrence_probe");
+    ASSERT_NOT_NULL(raw_probe);
+    ASSERT_EQ((uint32_t)(strstr(raw_probe, "fp ( )") - source), collision_start);
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *colliding_calls[2] = {NULL, NULL};
+    int colliding_carriers = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "occurrence_probe") &&
+            call->callee_name && strcmp(call->callee_name, "fp") == 0 &&
+            call->site_start_byte == collision_start && call->site_end_byte == collision_end) {
+            if (colliding_carriers < 2) {
+                colliding_calls[colliding_carriers] = call;
+            }
+            colliding_carriers++;
+        }
+    }
+    ASSERT_EQ(colliding_carriers, 2);
+    ASSERT_NOT_NULL(colliding_calls[0]);
+    ASSERT_NOT_NULL(colliding_calls[1]);
+
+    const CBMResolvedCall *alpha_semantic = NULL;
+    const CBMResolvedCall *bravo_semantic = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            resolved->site_start_byte != collision_start ||
+            resolved->site_end_byte != collision_end || !resolved->callee_qn || !resolved->reason ||
+            strcmp(resolved->reason, "fp") != 0) {
+            continue;
+        }
+        if (strstr(resolved->callee_qn, "alpha_target")) {
+            alpha_semantic = resolved;
+        }
+        if (strstr(resolved->callee_qn, "bravo_target")) {
+            bravo_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(alpha_semantic);
+    ASSERT_NOT_NULL(bravo_semantic);
+    const CBMResolvedCall *first_join =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, colliding_calls[0], false);
+    const CBMResolvedCall *second_join =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, colliding_calls[1], false);
+    ASSERT_TRUE((first_join == alpha_semantic && second_join == bravo_semantic) ||
+                (first_join == bravo_semantic && second_join == alpha_semantic));
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_preprocessed_destructor_rewrite_respects_origin_during_rewrite) {
+    /* Calibrate the comment padding against simplecpp itself: comments vanish
+     * from the expanded buffer, so one padding length makes the raw
+     * `delete alpha` and macro-expanded `delete bravo` occupy the same numeric
+     * byte span. The names intentionally have equal length.
+     *
+     * The raw destructor carrier is rewritten during the first C-LSP walk. On
+     * the second walk, a preprocessed carrier must be stamped PREPROCESSED
+     * before c_rewrite_proved_destructor_candidates compares it with the
+     * already-present raw semantic rows. Otherwise the earlier raw ~Alpha row
+     * wins this colliding occurrence and rewrites the expanded carrier to the
+     * wrong destructor. */
+    static const char format[] = "struct Alpha { ~Alpha(){} };\n"
+                                 "struct Bravo { ~Bravo(){} };\n"
+                                 "void occurrence_probe(){\n"
+                                 " Alpha* alpha = new Alpha(); Bravo* bravo = new Bravo();\n"
+                                 " /*%s*/ delete alpha;\n"
+                                 "#define HIDDEN_DELETE(p) delete p\n"
+                                 " HIDDEN_DELETE(bravo);\n"
+                                 "}\n";
+    char padding[1024] = {0};
+    char source[4096];
+    int written = snprintf(source, sizeof(source), format, padding);
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(source));
+
+    char *expanded = cbm_preprocess(source, written, "main.cpp", NULL, NULL, true);
+    ASSERT_NOT_NULL(expanded);
+    const char *raw_alpha = strstr(source, "delete alpha");
+    const char *expanded_bravo = strstr(expanded, "delete bravo");
+    ASSERT_NOT_NULL(raw_alpha);
+    ASSERT_NOT_NULL(expanded_bravo);
+    ptrdiff_t raw_offset = raw_alpha - source;
+    ptrdiff_t expanded_offset = expanded_bravo - expanded;
+    cbm_preprocess_free(expanded);
+    ASSERT_GTE(expanded_offset, raw_offset);
+    size_t padding_length = (size_t)(expanded_offset - raw_offset);
+    ASSERT_LT(padding_length, sizeof(padding));
+
+    memset(padding, 'x', padding_length);
+    padding[padding_length] = '\0';
+    written = snprintf(source, sizeof(source), format, padding);
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(source));
+
+    expanded = cbm_preprocess(source, written, "main.cpp", NULL, NULL, true);
+    ASSERT_NOT_NULL(expanded);
+    raw_alpha = strstr(source, "delete alpha");
+    expanded_bravo = strstr(expanded, "delete bravo");
+    ASSERT_NOT_NULL(raw_alpha);
+    ASSERT_NOT_NULL(expanded_bravo);
+    const uint32_t collision_start = (uint32_t)(raw_alpha - source);
+    ASSERT_EQ((uint32_t)(expanded_bravo - expanded), collision_start);
+    const uint32_t collision_end = collision_start + (uint32_t)strlen("delete alpha");
+    cbm_preprocess_free(expanded);
+
+    CBMFileResult *result = extract_cpp(source);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *raw_carrier = NULL;
+    const CBMCall *preprocessed_carrier = NULL;
+    const CBMResolvedCall *raw_semantic = NULL;
+    const CBMResolvedCall *preprocessed_semantic = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->requires_lsp_resolution || call->site_start_byte != collision_start ||
+            call->site_end_byte != collision_end) {
+            continue;
+        }
+        if (call->source_origin == CBM_SOURCE_ORIGIN_RAW) {
+            raw_carrier = call;
+        } else if (call->source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED) {
+            preprocessed_carrier = call;
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || !resolved->strategy ||
+            strcmp(resolved->strategy, "lsp_destructor") != 0 || !resolved->callee_qn ||
+            resolved->site_start_byte != collision_start ||
+            resolved->site_end_byte != collision_end) {
+            continue;
+        }
+        if (resolved->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+            strstr(resolved->callee_qn, "~Alpha")) {
+            raw_semantic = resolved;
+        } else if (resolved->source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED &&
+                   strstr(resolved->callee_qn, "~Bravo")) {
+            preprocessed_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(raw_carrier);
+    ASSERT_NOT_NULL(preprocessed_carrier);
+    ASSERT_NOT_NULL(raw_semantic);
+    ASSERT_NOT_NULL(preprocessed_semantic);
+
+    bool raw_name_ok = raw_carrier->callee_name &&
+                       strcmp(cbm_lsp_bare_segment(raw_carrier->callee_name), "~Alpha") == 0;
+    bool preprocessed_name_ok =
+        preprocessed_carrier->callee_name &&
+        strcmp(cbm_lsp_bare_segment(preprocessed_carrier->callee_name), "~Bravo") == 0;
+    bool raw_join_ok = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, raw_carrier,
+                                                        false) == raw_semantic;
+    bool preprocessed_join_ok =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, preprocessed_carrier, false) ==
+        preprocessed_semantic;
+    if (!raw_name_ok || !preprocessed_name_ok || !raw_join_ok || !preprocessed_join_ok) {
+        printf("  destructor origin rewrite diagnostic: raw=%s/%d preprocessed=%s/%d\n",
+               raw_carrier->callee_name ? raw_carrier->callee_name : "<null>", raw_join_ok,
+               preprocessed_carrier->callee_name ? preprocessed_carrier->callee_name : "<null>",
+               preprocessed_join_ok);
+    }
+    cbm_free_result(result);
+    ASSERT_TRUE(raw_name_ok);
+    ASSERT_TRUE(preprocessed_name_ok);
+    ASSERT_TRUE(raw_join_ok);
+    ASSERT_TRUE(preprocessed_join_ok);
+    PASS();
+}
+
 SUITE(c_lsp) {
+    RUN_TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences);
+    RUN_TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target);
+    RUN_TEST(clsp_cpp_repeated_same_leaf_calls_join_exact_occurrences);
+    RUN_TEST(clsp_cuda_repeated_same_leaf_calls_join_exact_occurrences);
+    RUN_TEST(clsp_cpp_new_expression_joins_exact_occurrence);
+    RUN_TEST(clsp_c_global_initializer_does_not_inherit_previous_function_caller);
+    RUN_TEST(clsp_c_preprocessed_coordinate_collision_isolated);
+    RUN_TEST(clsp_cpp_preprocessed_coordinate_collision_isolated);
+    RUN_TEST(clsp_cuda_preprocessed_coordinate_collision_isolated);
+    RUN_TEST(clsp_preprocessed_destructor_rewrite_respects_origin_during_rewrite);
+    RUN_TEST(clsp_tier2_shared_registry_readonly_c);
+    RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
+    RUN_TEST(seal_py_shared_registry_readonly);
+    RUN_TEST(registry_overlay_chain_iterates_and_copies_on_write);
+    RUN_TEST(clsp_method_return_refinement_is_copy_on_write);
+    RUN_TEST(seal_py_shared_registry_readonly_fields);
+    RUN_TEST(seal_cs_shared_registry_readonly);
+    RUN_TEST(seal_ts_shared_registry_readonly);
+    RUN_TEST(seal_go_shared_registry_readonly);
+    RUN_TEST(registry_short_name_indexes);
     RUN_TEST(clsp_simple_var_decl);
     RUN_TEST(clsp_pointer_arrow);
     RUN_TEST(clsp_dot_access);
@@ -15101,6 +16409,11 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_operator_stream);
     RUN_TEST(clsp_cross_file);
     RUN_TEST(clsp_nocrash_template_expression);
+    RUN_TEST(clsp_nocrash_template_extra_call_args);
+    RUN_TEST(clsp_nocrash_template_function_multi_param_nested_call);
+    RUN_TEST(clsp_calls_attributed_to_function_issue220);
+    RUN_TEST(clsp_nocrash_issue355_xxhash_header);
+    RUN_TEST(clsp_nocrash_issue312_default_template_auto_param);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_nested_namespace);
     RUN_TEST(clsp_nocrash_empty_source);

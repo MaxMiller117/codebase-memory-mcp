@@ -5,6 +5,7 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "extract_node_stack.h"
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
@@ -54,6 +55,25 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
             char *fname = cbm_node_text(a, func, source);
             if (fname && fname[0] >= 'A' && fname[0] <= 'Z') {
                 return fname;
+            }
+            /* Lower-cased package prefix: Go-style `pb.NewFooClient(...)` and
+             * Java-style `fooGrpc.newBlockingStub(...)`. Accept the qualified
+             * name when the last segment matches a typed-stub factory pattern.
+             * Downstream passes can use this to infer the constructed type. */
+            if (fname && fname[0]) {
+                const char *last = strrchr(fname, '.');
+                last = last ? last + 1 : fname;
+                bool is_factory = false;
+                if ((strncmp(last, "New", 3) == 0 || strncmp(last, "new", 3) == 0) && last[3]) {
+                    size_t llen = strlen(last);
+                    if ((llen > 6 && strcmp(last + llen - 6, "Client") == 0) ||
+                        (llen > 4 && strcmp(last + llen - 4, "Stub") == 0)) {
+                        is_factory = true;
+                    }
+                }
+                if (is_factory) {
+                    return fname;
+                }
             }
         }
     }
@@ -164,19 +184,14 @@ static void process_type_assign_node(CBMExtractCtx *ctx, TSNode node, const CBML
 }
 
 // Walk AST for assignment patterns where RHS is a constructor call.
-#define TYPE_ASSIGN_STACK_CAP 4096
 static void walk_type_assigns(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNode stack[TYPE_ASSIGN_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
-    while (top > 0) {
-        TSNode node = stack[--top];
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         process_type_assign_node(ctx, node, spec, cbm_enclosing_func_qn_cached(ctx, node));
-        enum { LAST_IDX = 1 };
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0 && top < TYPE_ASSIGN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
-        }
+        ts_nstack_push_children(&stack, node);
     }
 }
 

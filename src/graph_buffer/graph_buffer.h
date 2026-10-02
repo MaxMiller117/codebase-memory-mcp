@@ -24,7 +24,6 @@ typedef struct cbm_store cbm_store_t;
 
 typedef struct {
     int64_t id;           /* temp ID (sequential from 1) */
-    const char *project;  /* borrowed from gbuf */
     char *label;          /* heap-owned */
     char *name;           /* heap-owned */
     char *qualified_name; /* heap-owned */
@@ -36,7 +35,6 @@ typedef struct {
 
 typedef struct {
     int64_t id;            /* temp ID */
-    const char *project;   /* borrowed from gbuf */
     int64_t source_id;     /* temp node ID */
     int64_t target_id;     /* temp node ID */
     char *type;            /* heap-owned */
@@ -52,6 +50,12 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path);
  * IDs are allocated via atomic_fetch_add on *id_source.
  * Used for parallel extraction where multiple gbufs need unique IDs.
  * If id_source is NULL, behaves like cbm_gbuf_new(). */
+/* A worker buffer: shared ids, no secondary indexes (by label / name / edge
+ * type). It is filled by one worker and merged into the main buffer; the
+ * finders that need those indexes return nothing on it. */
+cbm_gbuf_t *cbm_gbuf_new_worker(const char *project, const char *root_path,
+                                _Atomic int64_t *id_source);
+
 cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
                                     _Atomic int64_t *id_source);
 
@@ -176,5 +180,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
  * Upserts nodes, inserts edges. Used for incremental indexing.
  * Returns 0 on success. */
 int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
+
+/* Replace a node's properties_json with a buffer-owned copy of json (NULL
+ * maps to "{}"). The buffer allocates and frees every string it owns through
+ * the memory core; passes that rewrite properties MUST go through here rather
+ * than freeing node->properties_json themselves. Returns 0, or -1 on OOM
+ * (the old value is kept). */
+int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json);
 
 #endif /* CBM_GRAPH_BUFFER_H */

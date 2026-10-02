@@ -25,6 +25,11 @@ typedef struct {
     const char *type;
     const char *properties; // JSON string
     const char *url_path;   // extracted from properties by Go (for idx_edges_url_path)
+    const char *local_name; // for IMPORTS edges: the UNESCAPED
+                            // json_extract(properties,'$.local_name') value; ""/NULL
+                            // otherwise. Feeds sqlite_autoindex_edges_1 — must match
+                            // what SQLite computes for the local_name_gen column or
+                            // integrity_check reports the row missing from the index.
 } CBMDumpEdge;
 
 typedef struct {
@@ -53,5 +58,36 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                  const char *indexed_at, CBMDumpNode *nodes, int node_count, CBMDumpEdge *edges,
                  int edge_count, CBMDumpVector *vectors, int vector_count,
                  CBMDumpTokenVec *token_vecs, int token_vec_count);
+
+// --- Streaming writer: incremental bulk node-table append ---
+//
+// Lets the indexer flush node rows (including heavy `properties`) to the DB in
+// batches, mid-pipeline, freeing heavy memory — while preserving the direct-page
+// bulk write (no per-row INSERTs). The nodes table is built across append calls
+// via a persistent page builder; everything else (edges, vectors, metadata,
+// indexes, sqlite_master) is written at finalize. cbm_write_db() above is a
+// one-shot wrapper over this API (open -> append all nodes -> finalize) and
+// produces byte-identical output.
+//
+// Usage: w = cbm_writer_open(path);
+//        cbm_writer_append_nodes(w, batch, n) x N  (ascending, contiguous ids);
+//        cbm_writer_finalize(w, ...);   // consumes + frees w, closes the file.
+typedef struct cbm_db_writer cbm_db_writer_t;
+
+cbm_db_writer_t *cbm_writer_open(const char *path);
+
+// Append a batch of node records. Heavy `properties` are consumed here, so the
+// caller may free them after this returns. Node ids must be ascending and
+// contiguous across the whole sequence of append calls. Returns 0 on success.
+int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int count);
+
+// Finalize: build the nodes-table interior, write edges/vectors/token_vectors,
+// metadata, all indexes, and sqlite_master + header. The node/edge/vector arrays
+// supply the (light) columns the index builders sort on; node `properties` are
+// NOT read here (already written during append). Frees w and closes the file.
+int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *root_path,
+                        const char *indexed_at, CBMDumpNode *nodes, int node_count,
+                        CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,
+                        int vector_count, CBMDumpTokenVec *token_vecs, int token_vec_count);
 
 #endif // CBM_SQLITE_WRITER_H

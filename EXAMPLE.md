@@ -94,13 +94,13 @@ flowchart TD
 ### Ring 1 — direct dependents
 
 ```cypher
-MATCH (a)-[:USAGE]->(b {name:'TroubleCodeDto'}) RETURN count(*)                          --> 88
+MATCH (b {name:'TroubleCodeDto'})<-[:USAGE]-(a) RETURN count(a)                          --> 170
 
-MATCH (a)-[:USAGE]->(b {name:'TroubleCodeDto'})
-WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(*)                                  --> 16
+MATCH (b {name:'TroubleCodeDto'})<-[:USAGE]-(a)
+WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(a)                                  --> 31
 ```
 
-**88 dependents (16 production, 72 test fixtures.)** The 16 production ones are the code that
+**170 dependents (31 production, 139 test fixtures).** The 31 production ones are the code that
 names the type directly — the MongoDB projectors (the `Dto ↔ Entity` mapping that *must* change or
 persistence breaks) and the fault-matching logic:
 
@@ -131,14 +131,14 @@ flowchart RL
 
 ### Rings 2–3 — the transitive blast radius (what a one-hop search misses)
 
-The 88 direct dependents are only the inner ring. `TroubleCodeDto` lives inside `FaultRuleDto`,
+The 170 direct dependents are only the inner ring. `TroubleCodeDto` lives inside `FaultRuleDto`,
 which lives inside `AlertRuleDto` — so **everything depending on those containers is impacted too:**
 
 | Layer in the chain | total deps | production deps |
 |---|---:|---:|
-| `TroubleCodeDto` (direct) | 88 | 16 |
-| `FaultRuleDto` (1 level up) | 90 | 18 |
-| `AlertRuleDto` (2 levels up) | 149 | **56** |
+| `TroubleCodeDto` (direct) | 170 | 31 |
+| `FaultRuleDto` (1 level up) | 186 | 41 |
+| `AlertRuleDto` (2 levels up) | 331 | **104** |
 
 ```mermaid
 flowchart RL
@@ -147,9 +147,9 @@ flowchart RL
     ARD["AlertRuleDto"]:::dto
     TCD -->|nested in| FRD -->|nested in| ARD
 
-    R1["Direct dependents<br/>projectors · AlertRuleHelper<br/>88 total · 16 prod"]:::hot --> TCD
-    R2["FaultRuleDto dependents<br/>fault projectors · seeders<br/>90 total · 18 prod"]:::dep --> FRD
-    R3["AlertRuleDto dependents<br/>WebApi + mobile-api controllers,<br/>read models, projectors<br/>149 total · 56 prod"]:::web --> ARD
+    R1["Direct dependents<br/>projectors · AlertRuleHelper<br/>170 total · 31 prod"]:::hot --> TCD
+    R2["FaultRuleDto dependents<br/>fault projectors · seeders<br/>186 total · 41 prod"]:::dep --> FRD
+    R3["AlertRuleDto dependents<br/>WebApi + mobile-api controllers,<br/>read models, projectors<br/>331 total · 104 prod"]:::web --> ARD
 
     classDef target fill:#f59e0b,stroke:#b45309,color:#1f2937;
     classDef dto  fill:#dbeafe,stroke:#2563eb,color:#1e3a8a;
@@ -163,8 +163,8 @@ The headline case is the **WebApi**. These endpoints return / accept `AlertRuleD
 `TroubleCodeDto`:**
 
 ```cypher
-MATCH (m)-[:USAGE]->(ar {name:'AlertRuleDto'})-[:USAGE]->(fr {name:'FaultRuleDto'})
-        -[:USAGE]->(tc {name:'TroubleCodeDto'})
+MATCH (tc {name:'TroubleCodeDto'})<-[:USAGE]-(fr {name:'FaultRuleDto'})
+        <-[:USAGE]-(ar {name:'AlertRuleDto'})<-[:USAGE]-(m)
 WHERE m.file_path CONTAINS 'WebApi' AND NOT (m.file_path CONTAINS 'Test')
 RETURN DISTINCT m.name, m.file_path
 ```
@@ -174,16 +174,18 @@ AlertRuleQueryController   BuildSummary, GetAsync, GetSummaryAsync,
                            GetSummaryByFaultCodeFilterAsync, GetSummaryByFaultCodeIdAsync,
                            GetSummaryByFaultCodeIdListAsync, GetSummaryByIdAsync,
                            GetSummaryByIdMultiAsync          (8 endpoints)
-AlertRuleCommandController SaveAsync, UpsertAlertAsync
+AlertRuleCommandController SaveAsync, UpsertAlertAsync, ValidateAlertRule,
+                           ValidateFingerprintSlugAsync
 SuperContextQueryController GetAlertRules
-                           — all in fleet-hd-web-api (+ mobile-api's AlertRuleQueryController)
+                           — all in fleet-hd-web-api (+ mobile-api's AlertRuleQueryController:
+                             GetAsync, GetSummaryAsync, BuildSummary)
 ```
 
 ```mermaid
 flowchart LR
     TCD["TroubleCodeDto<br/>changed"]:::target -->|nested in| FRD["FaultRuleDto"]:::dto
     FRD -->|nested in| ARD["AlertRuleDto"]:::dto
-    ARD -->|consumed by| WAPI["AlertRuleQueryController (8 endpoints),<br/>AlertRuleCommandController.Save/Upsert,<br/>SuperContextQueryController<br/>fleet-hd-web-api + mobile-api"]:::web
+    ARD -->|consumed by| WAPI["AlertRuleQueryController (8 endpoints),<br/>AlertRuleCommandController (4 methods),<br/>SuperContextQueryController<br/>fleet-hd-web-api + mobile-api"]:::web
     ARD -->|consumed by| AH["AlertHelper.GenerateAlertForFaultRuleResult<br/>fleet-hd-alert-service"]:::hot
 
     classDef target fill:#f59e0b,stroke:#b45309,color:#1f2937;
@@ -201,9 +203,9 @@ WebApi"* — there is no text pattern for it, and the affected files contain no 
 
 | | `grep` / text search | codebase-memory-mcp graph |
 |---|---|---|
-| **Direct dependents of `TroubleCodeDto`** | 219 hits / 36 files, undifferentiated | 88 (16 production, 72 fixtures), with paths |
+| **Direct dependents of `TroubleCodeDto`** | 219 hits / 36 files, undifferentiated | 170 (31 production, 139 fixtures), with paths |
 | **Transitive dependents** (via `FaultRuleDto`, `AlertRuleDto`) | **not findable** — affected files don't contain the string | followed in one multi-hop query |
-| **WebApi endpoints affected** | returns **0** rows | 11 production endpoints across 3 controllers |
+| **WebApi endpoints affected** | returns **0** rows | 13 production methods across 3 controllers |
 | **Persistence mapping** (projectors) | buried among PRDs/wikis/tests | surfaced as direct `USAGE` dependents |
 | **Generic type args** (`ICollection<TroubleCodeDto>`) | invisible unless read & parsed by hand | extracted automatically |
 | **Production vs test noise** | mixed together | split by query (`NOT file_path CONTAINS 'Test'`) |
@@ -224,9 +226,9 @@ Verified live in the current index:
 
 | Edge pattern | Count |
 |---|---|
-| `Class —USAGE→ Class` (class-level refs) | 4,972 |
-| `Method —USAGE→ Class` (method-body refs) | 25,627 |
-| Total `USAGE` edges | 87,668 |
+| `Class —USAGE→ Class` (class-level refs) | 5,695 |
+| `Method —USAGE→ Class` (method-body refs) | 52,885 |
+| Total `USAGE` edges | 420,277 |
 
 See `docs/LOCAL_PATCHES.md` for the implementation detail.
 
@@ -236,23 +238,25 @@ See `docs/LOCAL_PATCHES.md` for the implementation detail.
 
 ```cypher
 -- Ring 1: direct dependents (count, then production-only)
-MATCH (a)-[:USAGE]->(b {name:'TroubleCodeDto'}) RETURN count(*)
-MATCH (a)-[:USAGE]->(b {name:'TroubleCodeDto'}) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(*)
+MATCH (b {name:'TroubleCodeDto'})<-[:USAGE]-(a) RETURN count(a)
+MATCH (b {name:'TroubleCodeDto'})<-[:USAGE]-(a) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(a)
 
 -- the containment chain that hides it
-MATCH (ar {name:'AlertRuleDto'})-[:USAGE]->(fr {name:'FaultRuleDto'})-[:USAGE]->(tc {name:'TroubleCodeDto'})
-RETURN ar.name, fr.name, tc.name
+MATCH (tc {name:'TroubleCodeDto'})<-[:USAGE]-(fr {name:'FaultRuleDto'})<-[:USAGE]-(ar {name:'AlertRuleDto'})
+RETURN ar.file_path, fr.file_path, tc.file_path
 
 -- Rings 2–3: dependents of the containers (transitively affected)
-MATCH (a)-[:USAGE]->(b {name:'FaultRuleDto'}) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(*)
-MATCH (a)-[:USAGE]->(b {name:'AlertRuleDto'}) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(*)
+MATCH (b {name:'FaultRuleDto'})<-[:USAGE]-(a) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(a)
+MATCH (b {name:'AlertRuleDto'})<-[:USAGE]-(a) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(a)
 
 -- the WebApi endpoints that never mention TroubleCodeDto but are affected
-MATCH (m)-[:USAGE]->(ar {name:'AlertRuleDto'})-[:USAGE]->(fr {name:'FaultRuleDto'})
-        -[:USAGE]->(tc {name:'TroubleCodeDto'})
+MATCH (tc {name:'TroubleCodeDto'})<-[:USAGE]-(fr {name:'FaultRuleDto'})
+        <-[:USAGE]-(ar {name:'AlertRuleDto'})<-[:USAGE]-(m)
 WHERE m.file_path CONTAINS 'WebApi' AND NOT (m.file_path CONTAINS 'Test')
 RETURN DISTINCT m.name, m.file_path
 ```
 
 > Run via the `query_graph` MCP tool (project `C-Users-Max-source-repos`), or any agent wired to
-> codebase-memory-mcp. All numbers in this document are from a live index of the FleetHd repos.
+> codebase-memory-mcp. Put the named node first: v0.11 starts its scan there, and a pattern that
+> starts from an anonymous node stops at the 30 s query limit. Graph numbers are from the live index
+> on 2026-10-02 (binary 0.11.0-fleethd.2, worktrees excluded). The grep numbers are from 2026-05-27.

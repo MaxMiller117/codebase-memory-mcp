@@ -1,12 +1,20 @@
 import { useMemo } from "react";
 import * as THREE from "three";
 import type { GraphNode, GraphEdge } from "../lib/types";
+import { edgeIntensityScale } from "../lib/density";
 
 interface EdgeLinesProps {
   nodes: GraphNode[];
   edges: GraphEdge[];
   highlightedIds: Set<number> | null;
   opacity?: number;
+  /* User edge-brightness multiplier (see DisplaySettings). Layered on top of
+   * the automatic density scale. */
+  brightness?: number;
+  /* When set, edge.target is looked up in this array instead of `nodes`.
+   * Used for cross-galaxy edges where source lives in the primary graph
+   * and target lives in a linked project's offset-adjusted nodes. */
+  targetNodes?: GraphNode[];
 }
 
 function getClusterKey(fp?: string): string {
@@ -28,17 +36,43 @@ const EDGE_TYPE_COLORS: Record<string, string> = {
   IMPLEMENTS: "#f97316",
   HTTP_CALLS: "#e11d48",
   ASYNC_CALLS: "#ec4899",
+  GRPC_CALLS: "#f59e0b",
+  GRAPHQL_CALLS: "#e879f9",
+  TRPC_CALLS: "#a78bfa",
+  CROSS_HTTP_CALLS: "#fb923c",
+  CROSS_ASYNC_CALLS: "#fb7185",
+  CROSS_GRPC_CALLS: "#fbbf24",
+  CROSS_GRAPHQL_CALLS: "#f0abfc",
+  CROSS_TRPC_CALLS: "#c4b5fd",
+  CROSS_CHANNEL: "#fdba74",
   MEMBER_OF: "#64748b",
   TESTS_FILE: "#06b6d4",
 };
 
 const DEFAULT_EDGE_COLOR = "#1C8585";
 
-export function EdgeLines({ nodes, edges, highlightedIds, opacity = 1.0 }: EdgeLinesProps) {
+export function EdgeLines({
+  nodes,
+  edges,
+  highlightedIds,
+  opacity = 1.0,
+  brightness = 1.0,
+  targetNodes,
+}: EdgeLinesProps) {
   const geometry = useMemo(() => {
-    const idMap = new Map<number, number>();
+    /* Shrink per-edge glow as the edge count grows so the additively-blended
+     * center doesn't saturate to white; the user multiplier rides on top. */
+    const densityScale = edgeIntensityScale(edges.length) * brightness;
+    const srcMap = new Map<number, number>();
     for (let i = 0; i < nodes.length; i++) {
-      idMap.set(nodes[i].id, i);
+      srcMap.set(nodes[i].id, i);
+    }
+    const tgtArr = targetNodes ?? nodes;
+    const tgtMap = targetNodes ? new Map<number, number>() : srcMap;
+    if (targetNodes) {
+      for (let i = 0; i < targetNodes.length; i++) {
+        tgtMap.set(targetNodes[i].id, i);
+      }
     }
 
     const hasHighlight = highlightedIds && highlightedIds.size > 0;
@@ -47,12 +81,12 @@ export function EdgeLines({ nodes, edges, highlightedIds, opacity = 1.0 }: EdgeL
     let validCount = 0;
 
     for (const edge of edges) {
-      const si = idMap.get(edge.source);
-      const ti = idMap.get(edge.target);
+      const si = srcMap.get(edge.source);
+      const ti = tgtMap.get(edge.target);
       if (si === undefined || ti === undefined) continue;
 
       const s = nodes[si];
-      const t = nodes[ti];
+      const t = tgtArr[ti];
 
       const sHL = !hasHighlight || highlightedIds.has(s.id);
       const tHL = !hasHighlight || highlightedIds.has(t.id);
@@ -65,7 +99,11 @@ export function EdgeLines({ nodes, edges, highlightedIds, opacity = 1.0 }: EdgeL
        * With additive blending + dark background, these glow nicely. */
       let intensity = sameCluster ? 0.25 : 0.06;
       if (hasHighlight) {
-        intensity = sHL && tHL ? 0.5 : 0.04;
+        /* A selection stays at full strength (never density-scaled) so it
+         * pops against the dimmed rest; only the un-selected bulk is scaled. */
+        intensity = sHL && tHL ? 0.5 : 0.04 * densityScale;
+      } else {
+        intensity *= densityScale;
       }
 
       const off = validCount * 6;
@@ -99,7 +137,7 @@ export function EdgeLines({ nodes, edges, highlightedIds, opacity = 1.0 }: EdgeL
       new THREE.BufferAttribute(colors.slice(0, validCount * 6), 3),
     );
     return geo;
-  }, [nodes, edges, highlightedIds]);
+  }, [nodes, edges, highlightedIds, targetNodes, brightness]);
 
   return (
     <lineSegments geometry={geometry}>

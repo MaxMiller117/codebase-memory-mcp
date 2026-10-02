@@ -12,6 +12,7 @@
  *   - patterns with / are rooted (anchored to base)
  */
 #include "foundation/constants.h"
+#include "foundation/compat_fs.h"
 
 enum { GI_INIT_CAP = 16, GI_CHAR_IDX1 = 1, GI_CHAR_IDX2 = 2, GI_SKIP3 = 3 };
 #include "discover/discover.h"
@@ -38,17 +39,31 @@ struct cbm_gitignore {
 
 /* ── Pattern matching engine ─────────────────────────────────────── */
 
+/* Backtracking budget. `**` retries the remainder at every position, and
+ * consecutive literal + `**` groups multiply, so cost is exponential in the
+ * number of groups. Patterns come from a committed .gitignore / .cbmignore and
+ * every discovered path is matched against every pattern, so a small ignore file
+ * can make discovery take unbounded time. Cap the match steps per
+ * (pattern, path) pair.
+ *
+ * Exhausting the budget reports "no match", so a pathological pattern fails to
+ * ignore rather than ignoring the wrong files: the file gets indexed, which is
+ * the recoverable direction. The cap is far above any real pattern — ordinary
+ * globs finish in tens of steps. */
+enum { GI_MATCH_MAX_STEPS = 20000 };
+
 /* Forward declaration for recursive calls. */
-static bool glob_match(const char *pat, const char *str); // NOLINT(misc-no-recursion)
+static bool glob_match(const char *pat, const char *str,
+                       int *budget); // NOLINT(misc-no-recursion)
 
 /* Match a ** (doublestar-slash) pattern: try rest at every / boundary. */
 static bool glob_match_doublestar_slash(const char *pat, // NOLINT(misc-no-recursion)
-                                        const char *str) {
-    if (glob_match(pat, str)) {
+                                        const char *str, int *budget) {
+    if (glob_match(pat, str, budget)) {
         return true;
     }
     for (const char *s = str; *s; s++) {
-        if (*s == '/' && glob_match(pat, s + SKIP_ONE)) {
+        if (*s == '/' && glob_match(pat, s + SKIP_ONE, budget)) {
             return true;
         }
     }
@@ -57,9 +72,9 @@ static bool glob_match_doublestar_slash(const char *pat, // NOLINT(misc-no-recur
 
 /* Match a ** (doublestar) followed by non-slash: try at every position. */
 static bool glob_match_doublestar_any(const char *pat, // NOLINT(misc-no-recursion)
-                                      const char *str) {
+                                      const char *str, int *budget) {
     for (const char *s = str;; s++) {
-        if (glob_match(pat, s)) {
+        if (glob_match(pat, s, budget)) {
             return true;
         }
         if (!*s) {
@@ -69,9 +84,10 @@ static bool glob_match_doublestar_any(const char *pat, // NOLINT(misc-no-recursi
 }
 
 /* Match a * (single star): match any sequence not containing /. */
-static bool glob_match_star(const char *pat, const char *str) { // NOLINT(misc-no-recursion)
+static bool glob_match_star(const char *pat, const char *str,
+                            int *budget) { // NOLINT(misc-no-recursion)
     for (const char *s = str;; s++) {
-        if (glob_match(pat, s)) {
+        if (glob_match(pat, s, budget)) {
             return true;
         }
         if (!*s || *s == '/') {
@@ -118,24 +134,29 @@ static bool glob_match_charclass(const char *pat, char ch, const char **pat_out)
  * Handles: * (non-slash), ** (any path), ? (single non-slash), [class]
  */
 /* Handle ** at current position. Returns match result. */
-static bool glob_match_doublestar(const char *pat, const char *str) { // NOLINT(misc-no-recursion)
+static bool glob_match_doublestar(const char *pat, const char *str,
+                                  int *budget) { // NOLINT(misc-no-recursion)
     if (pat[GI_CHAR_IDX2] == '/') {
-        return glob_match_doublestar_slash(pat + GI_SKIP3, str);
+        return glob_match_doublestar_slash(pat + GI_SKIP3, str, budget);
     }
     if (pat[GI_CHAR_IDX2] == '\0') {
         return true;
     }
-    return glob_match_doublestar_any(pat + GI_CHAR_IDX2, str);
+    return glob_match_doublestar_any(pat + GI_CHAR_IDX2, str, budget);
 }
 
-static bool glob_match(const char *pat, const char *str) { // NOLINT(misc-no-recursion)
+static bool glob_match(const char *pat, const char *str,
+                       int *budget) { // NOLINT(misc-no-recursion)
+    if (--*budget <= 0) {
+        return false; /* budget exhausted — see GI_MATCH_MAX_STEPS */
+    }
     while (*pat && *str) {
         if (pat[0] == '*' && pat[GI_CHAR_IDX1] == '*') {
-            return glob_match_doublestar(pat, str);
+            return glob_match_doublestar(pat, str, budget);
         }
 
         if (*pat == '*') {
-            return glob_match_star(pat + SKIP_ONE, str);
+            return glob_match_star(pat + SKIP_ONE, str, budget);
         }
 
         if (*pat == '?') {
@@ -168,6 +189,13 @@ static bool glob_match(const char *pat, const char *str) { // NOLINT(misc-no-rec
         pat++;
     }
     return *pat == '\0' && *str == '\0';
+}
+
+/* Match one pattern against one path with a fresh backtracking budget. Not
+ * recursive itself — it seeds the budget and hands off to the engine. */
+static bool glob_match_bounded(const char *pat, const char *str) {
+    int budget = GI_MATCH_MAX_STEPS;
+    return glob_match(pat, str, &budget);
 }
 
 /* ── Pattern parsing ─────────────────────────────────────────────── */
@@ -287,7 +315,7 @@ cbm_gitignore_t *cbm_gitignore_load(const char *path) {
         return NULL;
     }
 
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         return NULL;
     }
@@ -319,7 +347,7 @@ cbm_gitignore_t *cbm_gitignore_load(const char *path) {
 
 /* Match a non-rooted pattern against basename and path suffixes. */
 static bool match_unrooted(const char *pattern, const char *rel_path, const char *basename) {
-    if (glob_match(pattern, basename)) {
+    if (glob_match_bounded(pattern, basename)) {
         return true;
     }
     if (!strchr(rel_path, '/')) {
@@ -328,7 +356,7 @@ static bool match_unrooted(const char *pattern, const char *rel_path, const char
     /* Try matching at every / boundary */
     const char *s = rel_path;
     while (*s) {
-        if (glob_match(pattern, s)) {
+        if (glob_match_bounded(pattern, s)) {
             return true;
         }
         const char *next = strchr(s, '/');
@@ -340,16 +368,16 @@ static bool match_unrooted(const char *pattern, const char *rel_path, const char
     return false;
 }
 
-bool cbm_gitignore_matches(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir) {
+int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir) {
     if (!gi || !rel_path) {
-        return false;
+        return 0;
     }
 
     /* Extract the basename for non-rooted pattern matching */
     const char *basename = strrchr(rel_path, '/');
     basename = basename ? basename + SKIP_ONE : rel_path;
 
-    bool matched = false;
+    int matched = 0;
 
     for (int i = 0; i < gi->count; i++) {
         const gi_pattern_t *p = &gi->patterns[i];
@@ -358,15 +386,19 @@ bool cbm_gitignore_matches(const cbm_gitignore_t *gi, const char *rel_path, bool
             continue;
         }
 
-        bool this_match = p->rooted ? glob_match(p->pattern, rel_path)
+        bool this_match = p->rooted ? glob_match_bounded(p->pattern, rel_path)
                                     : match_unrooted(p->pattern, rel_path, basename);
 
         if (this_match) {
-            matched = !p->negated;
+            matched = p->negated ? -1 : 1;
         }
     }
 
     return matched;
+}
+
+bool cbm_gitignore_matches(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir) {
+    return cbm_gitignore_match_result(gi, rel_path, is_dir) > 0;
 }
 
 void cbm_gitignore_free(cbm_gitignore_t *gi) {
@@ -378,4 +410,48 @@ void cbm_gitignore_free(cbm_gitignore_t *gi) {
     }
     free(gi->patterns);
     free(gi);
+}
+
+/* Test seam: lets a unit test simulate strdup() failure mid-merge so the
+ * atomic-rollback path can be exercised without real OOM. NULL = use strdup. */
+char *(*cbm_gitignore_merge_dup_hook_for_test)(const char *) = NULL;
+
+bool cbm_gitignore_merge(cbm_gitignore_t *dst, const cbm_gitignore_t *src) {
+    if (!dst) {
+        return false;
+    }
+    if (!src || src->count == 0) {
+        return true; /* nothing to merge */
+    }
+    int needed = dst->count + src->count;
+    if (needed > dst->capacity) {
+        gi_pattern_t *grown = realloc(dst->patterns, (size_t)needed * sizeof(gi_pattern_t));
+        if (!grown) {
+            return false; /* dst left unchanged */
+        }
+        dst->patterns = grown;
+        dst->capacity = needed;
+    }
+    int start_count = dst->count;
+    for (int i = 0; i < src->count; i++) {
+        char *pat = cbm_gitignore_merge_dup_hook_for_test
+                        ? cbm_gitignore_merge_dup_hook_for_test(src->patterns[i].pattern)
+                        : strdup(src->patterns[i].pattern);
+        if (!pat) {
+            /* Roll back partial copies so dst is unchanged on failure (atomic
+             * merge). A silent partial merge could drop the very exclude
+             * pattern the caller relied on while keeping others. */
+            for (int j = start_count; j < dst->count; j++) {
+                free(dst->patterns[j].pattern);
+            }
+            dst->count = start_count;
+            return false;
+        }
+        dst->patterns[dst->count].pattern = pat;
+        dst->patterns[dst->count].negated = src->patterns[i].negated;
+        dst->patterns[dst->count].dir_only = src->patterns[i].dir_only;
+        dst->patterns[dst->count].rooted = src->patterns[i].rooted;
+        dst->count++;
+    }
+    return true;
 }

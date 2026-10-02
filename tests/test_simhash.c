@@ -635,8 +635,9 @@ TEST(pass_similarity_same_file_tagged) {
     make_fp_props(props, sizeof(props), &fp);
 
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
-    int64_t id_a = cbm_gbuf_upsert_node(gb, "Function", "foo", "test.a.foo", "same.go", 1, 10, props);
-    cbm_gbuf_upsert_node(gb, "Function", "bar", "test.a.bar", "same.go", 11, 20, props);
+    cbm_gbuf_upsert_node(gb, "Function", "foo", "test.a.foo", "same.go", 1, 10, props);
+    int64_t id_b =
+        cbm_gbuf_upsert_node(gb, "Function", "bar", "test.a.bar", "same.go", 11, 20, props);
 
     atomic_int cancelled = 0;
     cbm_pipeline_ctx_t ctx = {
@@ -649,9 +650,11 @@ TEST(pass_similarity_same_file_tagged) {
 
     cbm_pipeline_pass_similarity(&ctx);
 
+    /* Pair ownership is canonical by qualified name (determinism fix):
+     * "test.a.bar" < "test.a.foo", so bar owns the pair and is the source. */
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
-    cbm_gbuf_find_edges_by_source_type(gb, id_a, "SIMILAR_TO", &edges, &edge_count);
+    cbm_gbuf_find_edges_by_source_type(gb, id_b, "SIMILAR_TO", &edges, &edge_count);
     ASSERT_EQ(edge_count, 1);
     /* Edge should have same_file property */
     ASSERT_NOT_NULL(strstr(edges[0]->properties_json, "\"same_file\":true"));
@@ -800,6 +803,45 @@ TEST(pass_similarity_short_funcs_skipped) {
     PASS();
 }
 
+TEST(pass_similarity_empty_graph_no_entries) {
+    /* Zero Function/Method nodes → the entry array is never allocated. The
+     * collect phase must not hand that null base to qsort: glibc declares qsort
+     * nonnull, so passing NULL is UB even at count 0 (#1367).
+     *
+     * WHERE THIS BINDS — read before "verifying" it. Remove the count > 1 guard
+     * in collect_fp_entries and this test still PASSES on macOS (Apple libc does
+     * not mark qsort nonnull) and on an ordinary Linux ASan/UBSan build, which
+     * merely prints "null pointer passed as argument 1" and keeps going. It goes
+     * RED only where UBSan TRAPS (-fno-sanitize-recover), where the process
+     * aborts and the runner exits 1. Measured both ways on ubuntu-arm64:
+     * recovering lane = 25 passed with AND without the guard; trapping lane =
+     * exit 1 without it, 25 passed with it.
+     *
+     * The assertions below are therefore the behavioural half (an empty graph
+     * yields rc 0 and no SIMILAR_TO edges); the UB half is caught by the
+     * trap-UBSan leg alone. Do not read a green recovering-lane run as proof
+     * that the null-base guard is still in place. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test",
+        .repo_path = "/tmp",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+
+    int rc = cbm_pipeline_pass_similarity(&ctx);
+    ASSERT_EQ(rc, 0);
+
+    int sim_count = count_similar_to_edges(gb);
+    ASSERT_EQ(sim_count, 0);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite 4: Full Pipeline Integration (generated test project)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -879,7 +921,7 @@ static void teardown_sim_test_repo(void) {
 
 TEST(pipeline_minhash_end_to_end) {
     if (setup_sim_test_repo() != 0) {
-        SKIP("failed to create temp dir");
+        FAIL("failed to create temp dir");
     }
 
     char db_path[512];
@@ -930,7 +972,7 @@ TEST(pipeline_minhash_end_to_end) {
 TEST(pipeline_minhash_no_false_positives) {
     snprintf(g_sim_tmpdir, sizeof(g_sim_tmpdir), "/tmp/cbm_sim_nofp_XXXXXX");
     if (!cbm_mkdtemp(g_sim_tmpdir)) {
-        SKIP("failed to create temp dir");
+        FAIL("failed to create temp dir");
     }
 
     /* 5 diverse functions — no clones */
@@ -1003,7 +1045,7 @@ TEST(pipeline_minhash_no_false_positives) {
 
 TEST(pipeline_minhash_incremental) {
     if (setup_sim_test_repo() != 0) {
-        SKIP("failed to create temp dir");
+        FAIL("failed to create temp dir");
     }
 
     char db_path[512];
@@ -1066,7 +1108,7 @@ TEST(pipeline_minhash_incremental) {
 
 TEST(pipeline_minhash_incremental_new_clone) {
     if (setup_sim_test_repo() != 0) {
-        SKIP("failed to create temp dir");
+        FAIL("failed to create temp dir");
     }
 
     char db_path[512];
@@ -1162,6 +1204,7 @@ SUITE(simhash) {
     RUN_TEST(pass_similarity_edge_properties);
     RUN_TEST(pass_similarity_max_edges_cap);
     RUN_TEST(pass_similarity_short_funcs_skipped);
+    RUN_TEST(pass_similarity_empty_graph_no_entries);
 
     /* Suite 4: Full Pipeline Integration */
     RUN_TEST(pipeline_minhash_end_to_end);

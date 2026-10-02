@@ -8,6 +8,7 @@
  * Runs as a post-pass after enrichment (both full and incremental).
  */
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
@@ -89,7 +90,27 @@ typedef struct {
     cbm_minhash_t fp;
     const char *file_path;
     const char *ext;
+    const char *qn; /* canonical ordering + pair-ownership (determinism) */
 } fp_entry_t;
+
+/* Canonical entry order: by qualified name (unique). The label-index order
+ * from collect_fp_entries is gbuf insertion order = parallel-extraction merge
+ * order, which varies run to run; LSH bucket chains and the per-node edge-cap
+ * truncation both inherit it, flickering WHICH SIMILAR_TO edges are emitted. */
+static int cmp_fp_entry_by_qn(const void *pa, const void *pb) {
+    const fp_entry_t *a = pa;
+    const fp_entry_t *b = pb;
+    const char *qa = a->qn ? a->qn : "";
+    const char *qb = b->qn ? b->qn : "";
+    int r = strcmp(qa, qb);
+    if (r != 0) {
+        return r;
+    }
+    if (a->node_id != b->node_id) {
+        return a->node_id < b->node_id ? -1 : 1;
+    }
+    return 0;
+}
 
 /* Collect all Function/Method nodes with fingerprints from graph buffer. */
 static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
@@ -112,7 +133,8 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
             }
             if (count >= cap) {
                 int new_cap = cap < FP_ENTRY_INIT_CAP ? FP_ENTRY_INIT_CAP : cap * FP_ENTRY_GROW;
-                fp_entry_t *grown = realloc(entries, (size_t)new_cap * sizeof(fp_entry_t));
+                fp_entry_t *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, entries,
+                                                (size_t)new_cap * sizeof(fp_entry_t));
                 if (!grown) {
                     break;
                 }
@@ -124,8 +146,15 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
                 .fp = fp,
                 .file_path = n->file_path,
                 .ext = file_ext(n->file_path),
+                .qn = n->qualified_name,
             };
         }
+    }
+    /* Canonicalize (determinism) — see cmp_fp_entry_by_qn. Avoid passing the
+     * NULL empty-set buffer to qsort: libc treats zero elements as a no-op,
+     * but the standard function contract still requires a valid base pointer. */
+    if (count > 1) {
+        qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
     }
     *out_entries = entries;
     return count;
@@ -151,7 +180,8 @@ static void sim_edge_buf_push(sim_edge_buf_t *buf, int64_t src, int64_t tgt, dou
                               bool same_file) {
     if (buf->count >= buf->cap) {
         int nc = buf->cap < SIM_EDGE_INIT_CAP ? SIM_EDGE_INIT_CAP : buf->cap * SIM_EDGE_GROW;
-        sim_deferred_edge_t *grown = realloc(buf->edges, (size_t)nc * sizeof(sim_deferred_edge_t));
+        sim_deferred_edge_t *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, buf->edges,
+                                                 (size_t)nc * sizeof(sim_deferred_edge_t));
         if (!grown) {
             return;
         }
@@ -203,7 +233,11 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             if (strcmp(src->ext, cand->file_ext) != 0) {
                 continue;
             }
-            if (src->node_id >= cand->node_id) {
+            /* Pair ownership by canonical QN order, not node id: ids are
+             * assigned in parallel-merge order and vary run to run, which
+             * flipped which side owned a pair and (with the per-source edge
+             * cap) flickered the emitted set (determinism). */
+            if (!src->qn || !cand->qualified_name || strcmp(src->qn, cand->qualified_name) >= 0) {
                 continue;
             }
 
@@ -240,9 +274,9 @@ static int merge_sim_edges(cbm_gbuf_t *gbuf, sim_edge_buf_t *worker_bufs, int wo
             cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SIMILAR_TO", props);
             total++;
         }
-        free(worker_bufs[w].edges);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, worker_bufs[w].edges);
     }
-    free(worker_bufs);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, worker_bufs);
     return total;
 }
 
@@ -262,7 +296,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     cbm_log_info("pass.similarity.collected", "nodes_with_fp", itoa_log(entry_count));
 
     if (entry_count < MIN_FP_ENTRIES) {
-        free(entries);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entries);
         cbm_log_info("pass.done", "pass", "similarity", "edges", "0");
         return 0;
     }
@@ -270,9 +304,10 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     /* Phase 2: Build LSH index (sequential — cbm_lsh_insert mutates shared state) */
     CBM_PROF_START(t_lsh_build);
     cbm_lsh_index_t *lsh = cbm_lsh_new();
-    cbm_lsh_entry_t *lsh_entries = malloc((size_t)entry_count * sizeof(cbm_lsh_entry_t));
+    cbm_lsh_entry_t *lsh_entries =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)entry_count * sizeof(cbm_lsh_entry_t));
     if (!lsh_entries) {
-        free(entries);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entries);
         cbm_lsh_free(lsh);
         return CBM_NOT_FOUND;
     }
@@ -283,6 +318,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .fingerprint = &entries[i].fp,
             .file_path = entries[i].file_path,
             .file_ext = entries[i].ext,
+            .qualified_name = entries[i].qn,
         };
         cbm_lsh_insert(lsh, &lsh_entries[i]);
     }
@@ -293,9 +329,11 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
      * in its own deferred buffer. Shared edge_counts is atomic.
      * Final merge into gbuf is sequential (gbuf not thread-safe). */
     CBM_PROF_START(t_query_emit);
-    _Atomic int *edge_counts = calloc((size_t)entry_count, sizeof(_Atomic int));
+    _Atomic int *edge_counts =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)((size_t)entry_count) * (sizeof(_Atomic int)));
     int worker_count = cbm_default_worker_count(false);
-    sim_edge_buf_t *worker_bufs = calloc((size_t)worker_count, sizeof(sim_edge_buf_t));
+    sim_edge_buf_t *worker_bufs = cbm_calloc(
+        CBM_MEM_CLASS_SEMANTIC, (size_t)((size_t)worker_count) * (sizeof(sim_edge_buf_t)));
 
     {
         sim_query_ctx_t sc = {
@@ -317,9 +355,9 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
 
     cbm_log_info("pass.done", "pass", "similarity", "edges", itoa_log(total_edges));
 
-    free(edge_counts);
-    free(lsh_entries);
-    free(entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, edge_counts);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, lsh_entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, entries);
     cbm_lsh_free(lsh);
     return 0;
 }

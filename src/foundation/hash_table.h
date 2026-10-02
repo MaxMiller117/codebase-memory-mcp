@@ -1,35 +1,34 @@
 /*
- * hash_table.h — Robin Hood open-addressing hash table (string → void*).
+ * hash_table.h — String → void* hash table.
  *
- * Design decisions:
- *   - Keys are interned or arena-allocated strings (NOT copied by the table)
- *   - Open addressing with Robin Hood insertion for bounded probe distance
- *   - Power-of-2 capacity with 75% load factor trigger for resize
- *   - Tombstone-free deletion via backward shift
+ * Public API unchanged across implementation rewrites. As of v2 the
+ * internals are Verstable (https://github.com/JacksonAllan/Verstable),
+ * a 2024 state-of-the-art open-addressing hash table with quadratic
+ * probing + per-bucket 4-bit hash fragments. The struct is opaque —
+ * callers MUST go through cbm_ht_create() and the API functions.
+ *
+ * Keys are borrowed pointers — the table does not copy or free them.
+ * Callers own the key strings for the lifetime of the entry.
  */
 #ifndef CBM_HASH_TABLE_H
 #define CBM_HASH_TABLE_H
 
 #include <stddef.h>
 #include <stdint.h>
+#include "mem_core.h" /* cbm_mem_class_t; same directory: the lsp_all unit has no -Isrc */
 #include <stdbool.h>
 
-typedef struct {
-    const char *key; /* borrowed pointer — caller owns the string */
-    void *value;
-    uint32_t hash; /* cached hash */
-    uint32_t psl;  /* probe sequence length (0 = empty slot) */
-} CBMHTEntry;
+/* Opaque — full definition lives in hash_table.c. */
+typedef struct CBMHashTable CBMHashTable;
 
-typedef struct {
-    CBMHTEntry *entries;
-    uint32_t capacity; /* always power of 2 */
-    uint32_t count;    /* number of live entries */
-    uint32_t mask;     /* capacity - 1, for fast modulo */
-} CBMHashTable;
-
-/* Create a hash table with initial capacity (rounded up to power of 2). */
+/* Create a hash table with initial capacity hint (used to pre-reserve
+ * buckets and avoid early growth; 0 = library default). */
 CBMHashTable *cbm_ht_create(uint32_t initial_capacity);
+
+/* Same, with the memory class the table's buckets and entries are charged
+ * to. cbm_ht_create charges CBM_MEM_CLASS_HASH_TABLE; an owner that wants
+ * its indexes attributed (the graph buffer: gbuf_index) names its class. */
+CBMHashTable *cbm_ht_create_in(cbm_mem_class_t cls, uint32_t initial_capacity);
 
 /* Free the hash table (does NOT free keys or values). */
 void cbm_ht_free(CBMHashTable *ht);

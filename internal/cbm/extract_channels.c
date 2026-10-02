@@ -24,14 +24,15 @@
 #include "arena.h"
 #include "helpers.h"
 #include "foundation/constants.h"
+#include "extract_node_stack.h"
 #include "tree_sitter/api.h"
 #include <stdint.h>
 #include <string.h>
 
 enum {
     CHAN_CONST_CAP = 256,  /* max tracked identifiers per file */
-    CHAN_STACK_CAP = 4096, /* tree-walk stack */
     CHAN_IDENT_MAX = 128,  /* max identifier length tracked */
+    CHAN_STACK_CAP = 4096, /* traversal stack depth per walk    */
     CHAN_DIR_UNKNOWN = -1, /* unrecognized method → no channel */
 };
 
@@ -93,15 +94,18 @@ static const char *literal_from_first_child(CBMExtractCtx *ctx, TSNode node) {
 
 /* ── Constant resolution table ──────────────────────────────────── */
 
-/* Walk the whole tree once and collect constant string bindings so later
- * passes can resolve bare-identifier channel arguments. */
+/* Walk the whole tree once and collect `const IDENT = "value"` bindings so
+ * later passes can resolve bare-identifier channel arguments.  Only scalar
+ * string literals are tracked — template literals and expressions are left
+ * unresolved.  This is a flat lookup; scope boundaries are ignored (a single
+ * const table per file is sufficient for the common Socket.IO pattern). */
 static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0 && tbl->count < CHAN_CONST_CAP) {
-        TSNode node = stack[--top];
+    while (stack.count > 0 && tbl->count < CHAN_CONST_CAP) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
         if (strcmp(kind, "variable_declarator") == 0) {
@@ -124,21 +128,18 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
             }
         }
 
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
-        }
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 /* Python constant resolution: NAME = "value" (assignment node). */
 static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0 && tbl->count < CHAN_CONST_CAP) {
-        TSNode node = stack[--top];
+    while (stack.count > 0 && tbl->count < CHAN_CONST_CAP) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
         if (strcmp(kind, "assignment") == 0) {
@@ -161,8 +162,8 @@ static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tb
         }
 
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -370,19 +371,17 @@ static void extract_channels_js(CBMExtractCtx *ctx) {
     chan_const_table_t consts = {0};
     scan_string_consts_js(ctx, &consts);
 
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    /* Second pass: walk the tree looking for call_expression nodes. */
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call_expression") == 0) {
             js_process_call(ctx, node, &consts);
         }
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
-        }
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -549,12 +548,12 @@ static void extract_channels_python(CBMExtractCtx *ctx) {
     chan_const_table_t consts = {0};
     scan_string_consts_python(ctx, &consts);
 
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "call") == 0) {
             py_process_call(ctx, node, &consts);
@@ -562,8 +561,8 @@ static void extract_channels_python(CBMExtractCtx *ctx) {
             py_process_decorator(ctx, node, &consts);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -627,18 +626,18 @@ static void go_process_call(CBMExtractCtx *ctx, TSNode call) {
 }
 
 static void extract_channels_go(CBMExtractCtx *ctx) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call_expression") == 0) {
             go_process_call(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -724,12 +723,12 @@ static void java_process_annotation(CBMExtractCtx *ctx, TSNode annotation) {
 }
 
 static void extract_channels_java(CBMExtractCtx *ctx) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "method_invocation") == 0) {
             java_process_call(ctx, node);
@@ -737,8 +736,8 @@ static void extract_channels_java(CBMExtractCtx *ctx) {
             java_process_annotation(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -793,18 +792,18 @@ static void csharp_process_call(CBMExtractCtx *ctx, TSNode call) {
 }
 
 static void extract_channels_csharp(CBMExtractCtx *ctx) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "invocation_expression") == 0) {
             csharp_process_call(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -856,18 +855,18 @@ static void ruby_process_call(CBMExtractCtx *ctx, TSNode call) {
 }
 
 static void extract_channels_ruby(CBMExtractCtx *ctx) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call") == 0) {
             ruby_process_call(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -958,12 +957,12 @@ static void elixir_process_function_def(CBMExtractCtx *ctx, TSNode func_def) {
 }
 
 static void extract_channels_elixir(CBMExtractCtx *ctx) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "call") == 0) {
             elixir_process_call(ctx, node);
@@ -971,8 +970,8 @@ static void extract_channels_elixir(CBMExtractCtx *ctx) {
             elixir_process_function_def(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -1034,18 +1033,18 @@ static void rust_process_call(CBMExtractCtx *ctx, TSNode call) {
 }
 
 static void extract_channels_rust(CBMExtractCtx *ctx) {
-    TSNode stack[CHAN_STACK_CAP];
-    int top = 0;
-    stack[top++] = ctx->root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call_expression") == 0) {
             rust_process_call(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < CHAN_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -1059,6 +1058,7 @@ void cbm_extract_channels(CBMExtractCtx *ctx) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         extract_channels_js(ctx);
         break;
     case CBM_LANG_PYTHON:

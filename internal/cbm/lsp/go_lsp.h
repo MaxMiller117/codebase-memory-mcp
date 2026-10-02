@@ -26,6 +26,10 @@ typedef struct {
     // Output: resolved calls accumulate here
     CBMResolvedCallArray* resolved_calls;
 
+    // AST-walk recursion depth for resolve_calls_in_node (guards stack overflow
+    // on deeply-nested/cyclic files; see cbm_lsp_max_walk_depth). Zero via memset.
+    int walk_depth;
+
     // Debug mode (CBM_LSP_DEBUG env)
     bool debug;
 } GoLSPContext;
@@ -80,7 +84,21 @@ typedef struct {
     const char* embedded_types; // "|"-separated embedded type QNs (for struct embedding)
     const char* field_defs;     // "|"-separated "name:type" pairs (for struct fields, e.g. "Binder:Binder|Name:string")
     const char* method_names_str; // "|"-separated method names for interfaces (e.g. "Get|Put|Delete")
+    const char **signature_param_types; // borrowed ordered parameter type texts; "?" means unknown
+    int signature_param_count;          // number of positional entries above
     bool is_interface;
+    CBMLanguage lang;           // language of the file that defined this — used by Tier 2 per-language registry build to filter all_defs
+    const char* namespace_name; // declared namespace/package for source-root-independent JVM filtering
+    /* Rust-only raw trait spelling.  The Rust registry canonicalizes this
+     * only when it has one exact/unique trait target. */
+    const char *trait_qn;
+    bool is_rust_impl_relation; // independent type-level impl record (empty impls survive)
+    bool is_abstract;           // Rust required trait method; false for defaults
+    /* Python-only raw decorator syntax, borrowed from CBMDefinition.  The
+     * resolver must retain it across fused/cross-file registry construction:
+     * a decorator rebinds the function name, so the undecorated definition is
+     * not automatically an exact callable-value target. */
+    const char **decorators;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.
@@ -96,6 +114,37 @@ void cbm_run_go_lsp_cross(
     const char** import_names, const char** import_qns, int import_count,
     TSTree* cached_tree,           // NULL = parse internally
     CBMResolvedCallArray* out);
+
+/* Tier 2 (gopls package-summary pattern):
+ * Build a project-wide, finalized CBMTypeRegistry from all Go defs ONCE.
+ * Run cross-file LSP per file using that shared registry — no per-file
+ * registry build, O(1) lookups, no Phase 1b/1c mutations. Reg is borrowed
+ * from arena (arena owns the storage); reg pointer is valid for arena
+ * lifetime. */
+CBMTypeRegistry* cbm_go_build_cross_registry(
+    CBMArena* arena, CBMLSPDef* defs, int def_count);
+
+void cbm_run_go_lsp_cross_with_registry(
+    CBMArena* arena,
+    const char* source, int source_len,
+    const char* module_qn,
+    CBMTypeRegistry* reg,          // pre-built, finalized, READ-ONLY
+    const char** import_names, const char** import_qns, int import_count,
+    TSTree* cached_tree,           // NULL = parse internally
+    CBMResolvedCallArray* out);
+
+/* Tier 3: AST-walk-free fast resolver. Iterates result->calls and
+ * resolves fully-qualified calls (pkg.Func) directly from the
+ * pre-built registry — no tree-sitter parse, no AST walk. Returns
+ * the count of calls that STILL need the slow path (methods on
+ * locals + qualified calls we couldn't resolve). When the return
+ * value is 0, the caller can skip the cbm_run_go_lsp_cross_with_
+ * registry parse+walk entirely. Resolved entries are appended to
+ * result->resolved_calls in result->arena. */
+int cbm_go_fast_resolve_qualified_calls(
+    CBMFileResult* result,
+    CBMTypeRegistry* reg,
+    const char** import_names, const char** import_qns, int import_count);
 
 // --- Batch cross-file LSP ---
 

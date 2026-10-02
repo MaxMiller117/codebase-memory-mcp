@@ -11,6 +11,8 @@
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
 #include "foundation/constants.h"
+#include "foundation/compat.h" // cbm_strcasestr
+#include "foundation/compat_fs.h"
 
 enum { LANG_SCAN_PASSES = 2 };
 #define SLEN(s) (sizeof(s) - 1)
@@ -48,6 +50,19 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* C# */
     {".cs", CBM_LANG_CSHARP},
+    /* Blazor components. The C# grammar recovers the @code block; the
+     * surrounding markup parses as ERROR regions and is reported via
+     * parse_partial, which is why this is a best-effort mapping rather
+     * than a dedicated grammar. */
+    {".razor", CBM_LANG_CSHARP},
+    /* Razor Pages / MVC views. Same Razor syntax and the same C# host as
+     * .razor, and equally unmapped before this: an ASP.NET Core app's views
+     * produced no nodes at all. The `@page` directive that defines a Razor
+     * Page lives in this file type, so the route extraction below matters
+     * more here than it does for components. Best-effort on the same terms:
+     * the C# grammar recovers the @{ } / @functions blocks, the surrounding
+     * markup lands in ERROR regions and is reported via parse_partial. */
+    {".cshtml", CBM_LANG_CSHARP},
 
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},
@@ -83,8 +98,14 @@ static const ext_entry_t EXT_TABLE[] = {
     {".ex", CBM_LANG_ELIXIR},
     {".exs", CBM_LANG_ELIXIR},
 
+    /* DotEnv */
+    {".env", CBM_LANG_DOTENV},
+
     /* Elm */
     {".elm", CBM_LANG_ELM},
+
+    /* ArkTS (HarmonyOS/OpenHarmony) */
+    {".ets", CBM_LANG_ARKTS},
 
     /* Emacs Lisp */
     {".el", CBM_LANG_EMACSLISP},
@@ -145,6 +166,8 @@ static const ext_entry_t EXT_TABLE[] = {
     /* JavaScript */
     {".js", CBM_LANG_JAVASCRIPT},
     {".jsx", CBM_LANG_JAVASCRIPT},
+    {".mjs", CBM_LANG_JAVASCRIPT}, /* ES modules (#197) */
+    {".cjs", CBM_LANG_JAVASCRIPT}, /* CommonJS modules */
 
     /* JSON */
     {".json", CBM_LANG_JSON},
@@ -174,11 +197,15 @@ static const ext_entry_t EXT_TABLE[] = {
     {".mdx", CBM_LANG_MARKDOWN},
 
     /* MATLAB */
+    {".m", CBM_LANG_MATLAB},
     {".matlab", CBM_LANG_MATLAB},
     {".mlx", CBM_LANG_MATLAB},
 
     /* Meson */
     {".meson", CBM_LANG_MESON},
+
+    /* Mojo */
+    {".mojo", CBM_LANG_MOJO},
 
     /* Nix */
     {".nix", CBM_LANG_NIX},
@@ -193,6 +220,19 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* PHP */
     {".php", CBM_LANG_PHP},
+
+    /* Oracle PL/SQL (do not map .sql — stays generic SQL; .prc stays FORM) */
+    {".pks", CBM_LANG_PLSQL},
+    {".pkb", CBM_LANG_PLSQL},
+    {".pck", CBM_LANG_PLSQL},
+    {".pls", CBM_LANG_PLSQL},
+    {".plb", CBM_LANG_PLSQL},
+    {".plsql", CBM_LANG_PLSQL},
+    {".fnc", CBM_LANG_PLSQL},
+    {".trg", CBM_LANG_PLSQL},
+    {".bdy", CBM_LANG_PLSQL},
+    {".tps", CBM_LANG_PLSQL},
+    {".tpb", CBM_LANG_PLSQL},
 
     /* Protobuf */
     {".proto", CBM_LANG_PROTOBUF},
@@ -240,6 +280,8 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* TypeScript */
     {".ts", CBM_LANG_TYPESCRIPT},
+    {".mts", CBM_LANG_TYPESCRIPT}, /* TS ES modules */
+    {".cts", CBM_LANG_TYPESCRIPT}, /* TS CommonJS modules */
 
     /* VimScript */
     {".vim", CBM_LANG_VIMSCRIPT},
@@ -247,6 +289,7 @@ static const ext_entry_t EXT_TABLE[] = {
     {"justfile", CBM_LANG_JUST},
     {"Justfile", CBM_LANG_JUST},
     {".justfile", CBM_LANG_JUST},
+    {".just", CBM_LANG_JUST}, /* `import 'common.just'` target files */
     {"hyprland.conf", CBM_LANG_HYPRLANG},
     {"ssh_config", CBM_LANG_SSHCONFIG},
     {"sshd_config", CBM_LANG_SSHCONFIG},
@@ -254,6 +297,17 @@ static const ext_entry_t EXT_TABLE[] = {
     {"BUILD.bazel", CBM_LANG_STARLARK},
     {"WORKSPACE", CBM_LANG_STARLARK},
     {"WORKSPACE.bazel", CBM_LANG_STARLARK},
+
+    /* BitBake include fragments — `require/include foo.inc` target files.
+     * NOTE: .inc is also used by ObjectScript include (macro) files; the
+     * ambiguity is resolved by content in cbm_disambiguate_inc(). */
+    {".inc", CBM_LANG_BITBAKE},
+
+    /* InterSystems ObjectScript routines (.mac/.int/.rtn unambiguous; .cls is
+     * shared with Apex and resolved by content in cbm_disambiguate_cls()). */
+    {".mac", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+    {".int", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+    {".rtn", CBM_LANG_OBJECTSCRIPT_ROUTINE},
 
     /* Vue */
     {".vue", CBM_LANG_VUE},
@@ -367,6 +421,7 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Go Template */
     {".gotmpl", CBM_LANG_GOTEMPLATE},
+    {".tpl", CBM_LANG_GOTEMPLATE}, /* Helm _helpers.tpl named-template definitions */
 
     /* Hare */
     {".ha", CBM_LANG_HARE},
@@ -425,6 +480,16 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Luau */
     {".luau", CBM_LANG_LUAU},
 
+    /* Qt QML */
+    {".qml", CBM_LANG_QML},
+
+    /* CFML / ColdFusion — .cfm are tag templates; .cfc components may be EITHER
+     * script-dialect (component { ... }) or tag-dialect (<cfcomponent> ...). The
+     * table default is script; tag-based .cfc are resolved by content in
+     * cbm_disambiguate_cfc(). */
+    {".cfc", CBM_LANG_CFSCRIPT},
+    {".cfm", CBM_LANG_CFML},
+
     /* Mermaid */
     {".mermaid", CBM_LANG_MERMAID},
 
@@ -441,10 +506,8 @@ static const ext_entry_t EXT_TABLE[] = {
     {".ncl", CBM_LANG_NICKEL},
 
     /* Nim */
-    {".nim", CBM_LANG_NIM},
 
     /* Nim */
-    {".nims", CBM_LANG_NIM},
 
     /* Squirrel */
     {".nut", CBM_LANG_SQUIRREL},
@@ -460,6 +523,9 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Diff */
     {".patch", CBM_LANG_DIFF},
+
+    /* Pine Script */
+    {".pine", CBM_LANG_PINE},
 
     /* Pkl */
     {".pkl", CBM_LANG_PKL},
@@ -500,6 +566,9 @@ static const ext_entry_t EXT_TABLE[] = {
     /* ReScript */
     {".resi", CBM_LANG_RESCRIPT},
 
+    /* Regex */
+    {".re", CBM_LANG_REGEX},
+
     /* Racket */
     {".rkt", CBM_LANG_RACKET},
 
@@ -517,6 +586,11 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Scheme */
     {".scm", CBM_LANG_SCHEME},
+
+    /* Chialisp — .clsp puzzles, .clib/.clinc includable libraries */
+    {".clsp", CBM_LANG_CHIALISP},
+    {".clib", CBM_LANG_CHIALISP},
+    {".clinc", CBM_LANG_CHIALISP},
 
     /* Slang */
     {".slang", CBM_LANG_SLANG},
@@ -640,6 +714,9 @@ static const filename_entry_t FILENAME_TABLE[] = {
     {"requirements-test.txt", CBM_LANG_REQUIREMENTS},
     {"Kconfig", CBM_LANG_KCONFIG},
     {"go.mod", CBM_LANG_GOMOD},
+    {".env", CBM_LANG_DOTENV},
+    {".env.local", CBM_LANG_DOTENV},
+    {".gitattributes", CBM_LANG_GITATTRIBUTES},
 
 };
 
@@ -714,6 +791,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_WOLFRAM] = "Wolfram",
     [CBM_LANG_KUSTOMIZE] = "Kustomize",
     [CBM_LANG_K8S] = "Kubernetes",
+    [CBM_LANG_PINE] = "PineScript",
     [CBM_LANG_SOLIDITY] = "Solidity",
     [CBM_LANG_TYPST] = "Typst",
     [CBM_LANG_GDSCRIPT] = "GDScript",
@@ -723,6 +801,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_DLANG] = "D",
     [CBM_LANG_NIM] = "Nim",
     [CBM_LANG_SCHEME] = "Scheme",
+    [CBM_LANG_CHIALISP] = "Chialisp",
     [CBM_LANG_FENNEL] = "Fennel",
     [CBM_LANG_FISH] = "Fish",
     [CBM_LANG_AWK] = "AWK",
@@ -740,6 +819,9 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_HARE] = "Hare",
     [CBM_LANG_PONY] = "Pony",
     [CBM_LANG_LUAU] = "Luau",
+    [CBM_LANG_QML] = "QML",
+    [CBM_LANG_CFSCRIPT] = "CFML",
+    [CBM_LANG_CFML] = "CFML",
     [CBM_LANG_JANET] = "Janet",
     [CBM_LANG_SWAY] = "Sway",
     [CBM_LANG_NASM] = "NASM",
@@ -803,6 +885,12 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_APEX] = "Apex",
     [CBM_LANG_SOQL] = "SOQL",
     [CBM_LANG_SOSL] = "SOSL",
+    [CBM_LANG_MOJO] = "Mojo",
+    [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
+    [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
+    [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
+    [CBM_LANG_ARKTS] = "ArkTS",
+    [CBM_LANG_PLSQL] = "PL/SQL",
 
 };
 
@@ -842,6 +930,15 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
         }
     }
 
+    /* DotEnv variant filenames (".env.local", ".env.production", …): the
+     * filename starts with ".env." but its last "extension" (e.g. ".local")
+     * is not a real language extension.  Match the dotenv convention used by
+     * pass_envscan/pass_infrascan (".env" exact, ".env." prefix, "*.env"
+     * suffix) so file-index routing agrees with direct extraction. */
+    if (strncmp(filename, ".env.", SLEN(".env.")) == 0) {
+        return CBM_LANG_DOTENV;
+    }
+
     /* Fall back to extension-based lookup.
      * For compound extensions (e.g. ".blade.php") defined in the user config,
      * scan from the first dot in the basename toward the last, checking user
@@ -851,17 +948,31 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
         return CBM_LANG_COUNT;
     }
 
-    /* Probe user config for compound extensions (e.g. ".blade.php"). */
+    /* Probe compound extensions (e.g. ".blade.php") from the first dot toward
+     * the last. Built-in compounds are checked first so e.g. Laravel Blade
+     * templates map to Blade rather than the single-extension fallback (PHP);
+     * user config can still add more (#258). */
+    static const struct {
+        const char *ext;
+        CBMLanguage lang;
+    } COMPOUND_EXT_TABLE[] = {
+        {".blade.php", CBM_LANG_BLADE},
+    };
     const cbm_userconfig_t *ucfg = cbm_get_user_lang_config();
-    if (ucfg) {
-        const char *p = strchr(filename, '.');
-        while (p && p < last_dot) {
+    const char *p = strchr(filename, '.');
+    while (p && p < last_dot) {
+        for (size_t i = 0; i < sizeof(COMPOUND_EXT_TABLE) / sizeof(COMPOUND_EXT_TABLE[0]); i++) {
+            if (strcmp(p, COMPOUND_EXT_TABLE[i].ext) == 0) {
+                return COMPOUND_EXT_TABLE[i].lang;
+            }
+        }
+        if (ucfg) {
             CBMLanguage lang = cbm_userconfig_lookup(ucfg, p);
             if (lang != CBM_LANG_COUNT) {
                 return lang;
             }
-            p = strchr(p + SKIP_ONE, '.');
         }
+        p = strchr(p + SKIP_ONE, '.');
     }
 
     /* Standard single-extension lookup (built-ins + user overrides). */
@@ -873,6 +984,172 @@ const char *cbm_language_name(CBMLanguage lang) {
         return "Unknown";
     }
     return LANG_NAMES[lang] ? LANG_NAMES[lang] : "Unknown";
+}
+
+/* ── Shebang interpreter detection (extensionless scripts) ────────── */
+
+/* Basename of an interpreter path: the segment after the last '/'.  Shebangs
+ * are a POSIX convention, so only '/' is treated as a separator. */
+static const char *interp_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + SKIP_ONE : path;
+}
+
+/* "python" optionally followed by an explicit numeric version (digits and dots
+ * only, e.g. "python3", "python3.12").  Bounded and explicit so arbitrary
+ * suffixes like "python-wrapper" are rejected. */
+static bool is_python_interp(const char *base) {
+    if (strncmp(base, "python", SLEN("python")) != 0) {
+        return false;
+    }
+    const char *version = base + SLEN("python");
+    if (*version == '\0') {
+        return true;
+    }
+
+    /* Each numeric component must contain at least one digit. */
+    bool need_digit = true;
+    for (const char *v = version; *v; v++) {
+        if (isdigit((unsigned char)*v)) {
+            need_digit = false;
+        } else if (*v == '.' && !need_digit) {
+            need_digit = true;
+        } else {
+            return false;
+        }
+    }
+    return !need_digit;
+}
+
+/* Map an interpreter basename to a language, or CBM_LANG_COUNT if unrecognized.
+ * Non-python interpreters are matched exactly (no prefix/suffix logic). */
+static CBMLanguage lang_for_interpreter(const char *base) {
+    if (is_python_interp(base)) {
+        return CBM_LANG_PYTHON;
+    }
+    static const struct {
+        const char *name;
+        CBMLanguage lang;
+    } INTERP_TABLE[] = {
+        {"sh", CBM_LANG_BASH},           {"bash", CBM_LANG_BASH}, {"dash", CBM_LANG_BASH},
+        {"ksh", CBM_LANG_BASH},          {"zsh", CBM_LANG_BASH},  {"node", CBM_LANG_JAVASCRIPT},
+        {"nodejs", CBM_LANG_JAVASCRIPT}, {"ruby", CBM_LANG_RUBY}, {"perl", CBM_LANG_PERL},
+        {"php", CBM_LANG_PHP},           {"lua", CBM_LANG_LUA},
+    };
+    for (size_t i = 0; i < sizeof(INTERP_TABLE) / sizeof(INTERP_TABLE[0]); i++) {
+        if (strcmp(base, INTERP_TABLE[i].name) == 0) {
+            return INTERP_TABLE[i].lang;
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
+/* Advance *cursor past leading blanks and return the next whitespace-delimited
+ * token (NUL-terminated in place), or NULL when the line is exhausted. */
+static char *shebang_next_token(char **cursor) {
+    char *p = *cursor;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '\0') {
+        *cursor = p;
+        return NULL;
+    }
+    char *start = p;
+    while (*p && *p != ' ' && *p != '\t') {
+        p++;
+    }
+    if (*p) {
+        *p = '\0';
+        p++;
+    }
+    *cursor = p;
+    return start;
+}
+
+CBMLanguage cbm_language_from_shebang(const char *path) {
+    if (!path) {
+        return CBM_LANG_COUNT;
+    }
+
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return CBM_LANG_COUNT; /* fail closed on read error */
+    }
+
+    /* Read only a bounded first line. */
+    char buf[CBM_SZ_256];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf) - SKIP_ONE, f);
+
+    /* Fail closed on any read error rather than parsing a partial buffer. */
+    if (ferror(f)) {
+        (void)fclose(f);
+        return CBM_LANG_COUNT;
+    }
+
+    /* If the bounded buffer filled without containing a newline, the first
+     * line may extend past our bound. Probe a single extra byte to tell an
+     * exact EOF (the whole file is <= 255 bytes) from a truncated longer
+     * line: any surviving byte -- including a newline just beyond the bound --
+     * means the first line was cut off, so fail closed. A probe read error
+     * fails closed too. This keeps the read bounded (no unbounded line read
+     * or allocation). */
+    bool have_newline = (memchr(buf, '\n', n) != NULL);
+    if (!have_newline && n == sizeof(buf) - SKIP_ONE) {
+        int probe = fgetc(f);
+        if (probe != EOF || ferror(f)) {
+            (void)fclose(f);
+            return CBM_LANG_COUNT;
+        }
+    }
+    (void)fclose(f);
+
+    /* Must begin with "#!". */
+    if (n < PAIR_LEN || buf[0] != '#' || buf[1] != '!') {
+        return CBM_LANG_COUNT;
+    }
+
+    /* Isolate the first line; reject an embedded NUL before the newline. */
+    size_t line_len = 0;
+    while (line_len < n && buf[line_len] != '\n') {
+        if (buf[line_len] == '\0') {
+            return CBM_LANG_COUNT; /* embedded NUL — treat as binary */
+        }
+        line_len++;
+    }
+    /* Trim a trailing CR so CRLF first lines parse. */
+    if (line_len > 0 && buf[line_len - SKIP_ONE] == '\r') {
+        line_len--;
+    }
+    buf[line_len] = '\0';
+
+    /* First token after "#!" is the interpreter (or env). */
+    char *cursor = buf + PAIR_LEN;
+    char *interp = shebang_next_token(&cursor);
+    if (!interp) {
+        return CBM_LANG_COUNT;
+    }
+    const char *base = interp_basename(interp);
+
+    /* "env [-S] <interp> [args...]": the real interpreter is the next token.
+     * Only the plain "env <interp>" and "env -S/--split-string <interp> [args]"
+     * shapes are supported. After the optional -S, the interpreter token must
+     * be a real command, so reject option tokens (leading '-') and NAME=value
+     * assignments (containing '=') -- e.g. "env PYTHON=/usr/bin/python
+     * python-wrapper", where env would treat the first token as an env-var
+     * setting rather than the program to run. */
+    if (strcmp(base, "env") == 0) {
+        char *tok = shebang_next_token(&cursor);
+        if (tok && (strcmp(tok, "-S") == 0 || strcmp(tok, "--split-string") == 0)) {
+            tok = shebang_next_token(&cursor);
+        }
+        if (!tok || tok[0] == '-' || strchr(tok, '=') != NULL) {
+            return CBM_LANG_COUNT;
+        }
+        base = interp_basename(tok);
+    }
+
+    return lang_for_interpreter(base);
 }
 
 /* ── .m file disambiguation ──────────────────────────────────────── */
@@ -944,7 +1221,7 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
         return CBM_LANG_MATLAB;
     }
 
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         return CBM_LANG_MATLAB;
     }
@@ -970,4 +1247,200 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     }
 
     return CBM_LANG_MATLAB;
+}
+
+/* Visual Basic 6 / VBA source exports are recognisable from their header (#721):
+ * every module carries `Attribute VB_Name = "..."`, class modules open with
+ * `VERSION 1.0 CLASS`, forms/controls with `VERSION 5.00` + `Begin VB.Form` /
+ * `Begin VB.UserControl`. None of these occur in Apex or ObjectScript classes
+ * or in FORM programs, whose .cls / .frm extensions VB6 happens to share. */
+static bool has_vb6_markers(const char *buf) {
+    return str_contains(buf, "Attribute VB_Name") || str_contains(buf, "VERSION 1.0 CLASS") ||
+           str_contains(buf, "Begin VB.") || str_contains(buf, "\nOption Explicit");
+}
+
+/* Disambiguate .frm files: shared by the FORM symbolic-manipulation language
+ * and Visual Basic 6 forms (#721). There is no Visual Basic language yet, so a
+ * VB6 form is reported as unsupported (CBM_LANG_COUNT) rather than handed to
+ * the FORM grammar, which yields no defs and stray junk nodes. Defaults to
+ * FORM on any doubt (preserves existing behaviour). */
+CBMLanguage cbm_disambiguate_frm(const char *path) {
+    if (!path) {
+        return CBM_LANG_FORM;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_FORM;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    /* VB6 form files open with "VERSION x.yy" on line 1. */
+    if (strncmp(buf, "VERSION ", SLEN("VERSION ")) == 0 &&
+        isdigit((unsigned char)buf[SLEN("VERSION ")])) {
+        return CBM_LANG_COUNT;
+    }
+    return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
+}
+
+/* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
+ * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
+ * with a line of the form "Class <UppercasePackage>..."; VB6 class modules
+ * carry the VB6 header markers and are reported as unsupported (CBM_LANG_COUNT)
+ * until a Visual Basic grammar exists. Defaults to Apex on any doubt. */
+CBMLanguage cbm_disambiguate_cls(const char *path) {
+    if (!path) {
+        return CBM_LANG_APEX;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_APEX;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    if (has_vb6_markers(buf)) {
+        return CBM_LANG_COUNT;
+    }
+
+    const char *line = buf;
+    while (*line) {
+        if (strncmp(line, "Class ", SLEN("Class ")) == 0 &&
+            isupper((unsigned char)line[SLEN("Class ")])) {
+            return CBM_LANG_OBJECTSCRIPT_UDL;
+        }
+        const char *nl = strchr(line, '\n');
+        if (!nl) {
+            break;
+        }
+        line = nl + SKIP_ONE;
+    }
+    return CBM_LANG_APEX;
+}
+
+/* Disambiguate .inc files: shared by BitBake include fragments and
+ * InterSystems ObjectScript include (macro) files. ObjectScript .inc files are
+ * predominantly macro definitions ("#define NAME ..." / "#def1arg NAME ...");
+ * some also carry a "ROUTINE <Name>" header. The macro-preprocessor directives
+ * are the strongest signal because that is the primary content of an .inc file,
+ * whereas BitBake uses '#' only for "# comment" lines (always '#' + space).
+ * We therefore match ObjectScript preprocessor directives ('#' immediately
+ * followed by 'def'/';'), which BitBake never produces. Defaults to BitBake on
+ * any doubt (preserves existing behaviour). */
+CBMLanguage cbm_disambiguate_inc(const char *path) {
+    if (!path) {
+        return CBM_LANG_BITBAKE;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_BITBAKE;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    const char *line = buf;
+    while (*line) {
+        /* ObjectScript include header: a line beginning "ROUTINE <Uppercase>". */
+        if (strncmp(line, "ROUTINE ", SLEN("ROUTINE ")) == 0 &&
+            isupper((unsigned char)line[SLEN("ROUTINE ")])) {
+            return CBM_LANG_OBJECTSCRIPT_ROUTINE;
+        }
+        /* ObjectScript macro directives — the primary content of .inc files.
+         * "#define"/"#def1arg" (macro defs) and "#;" (line comment). BitBake's
+         * only '#' use is "# comment" (hash + space), so these never collide. */
+        if (strncmp(line, "#define", SLEN("#define")) == 0 ||
+            strncmp(line, "#def1arg", SLEN("#def1arg")) == 0 ||
+            strncmp(line, "#;", SLEN("#;")) == 0) {
+            return CBM_LANG_OBJECTSCRIPT_ROUTINE;
+        }
+        const char *nl = strchr(line, '\n');
+        if (!nl) {
+            break;
+        }
+        line = nl + SKIP_ONE;
+    }
+    return CBM_LANG_BITBAKE;
+}
+
+/* Case-insensitive prefix match (portable — no strncasecmp dependency). */
+static bool starts_with_ci(const char *s, const char *prefix) {
+    for (; *prefix; s++, prefix++) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Disambiguate .cfc files: a ColdFusion component may be written in the script
+ * dialect ("component { ... }", parsed by the JS-like cfscript grammar) or the
+ * tag dialect ("<cfcomponent> ... <cffunction>", parsed by the HTML-derived cfml
+ * grammar). The extension table defaults to cfscript because that is what modern
+ * Lucee/ACF templates use, but large legacy codebases are predominantly tag-based
+ * and feeding those to the wrong grammar fails wholesale. Routing rules:
+ *   1. A "<cfcomponent" or top-level "<cffunction" tag ⇒ tag dialect. (The latter
+ *      catches "bare" tag components that omit the <cfcomponent> wrapper.) This
+ *      wins regardless of any leading <!---/<cfscript>, so it is checked first.
+ *   2. Otherwise the file is script-dialect content. Find the first significant
+ *      token, skipping whitespace and <!--- ---> comments:
+ *        - a leading "<cfscript>" wrapper is still script content ⇒ cfscript;
+ *        - a different leading tag (e.g. <cfquery> in a bare-tag file) ⇒ cfml;
+ *        - anything else ("component { ... }") ⇒ cfscript.
+ * Defaults to CBM_LANG_CFSCRIPT on any doubt (preserves table behaviour). */
+CBMLanguage cbm_disambiguate_cfc(const char *path) {
+    if (!path) {
+        return CBM_LANG_CFSCRIPT;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_CFSCRIPT;
+    }
+
+    /* Read a generous head: tag components can carry a large license/revision
+     * comment block before the <cfcomponent> opener. */
+    char buf[CBM_SZ_16K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_16K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    /* Rule 1: explicit tag-component markers ⇒ tag dialect. */
+    if (cbm_strcasestr(buf, "<cfcomponent") != NULL || cbm_strcasestr(buf, "<cffunction") != NULL) {
+        return CBM_LANG_CFML;
+    }
+
+    /* Rule 2: locate the first significant token, past whitespace and comments. */
+    const char *p = buf;
+    for (;;) {
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (starts_with_ci(p, "<!---")) {
+            const char *end = strstr(p + SLEN("<!---"), "--->");
+            if (!end) {
+                break; /* comment runs past the buffer — treat as no token */
+            }
+            p = end + SLEN("--->");
+            continue;
+        }
+        break;
+    }
+    if (*p == '<') {
+        /* A leading <cfscript> wrapper is script content; any other leading tag
+         * (bare-tag file) is tag content. */
+        return starts_with_ci(p, "<cfscript") ? CBM_LANG_CFSCRIPT : CBM_LANG_CFML;
+    }
+    return CBM_LANG_CFSCRIPT;
 }

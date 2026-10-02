@@ -264,6 +264,68 @@ TEST(resolve_same_module) {
     PASS();
 }
 
+/* A package/namespace-qualified callee whose bare name is defined in several
+ * places must resolve to the package named in the call — not collapse onto a
+ * single winner. Regression for qualified cross-file calls (e.g. Perl
+ * Foo::Bar::sub()) where the same sub name exists in multiple packages. */
+TEST(resolve_qualified_disambiguates_same_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "save", "proj.lib.App.Alpha.save", "Function");
+    cbm_registry_add(r, "save", "proj.lib.App.Beta.save", "Function");
+    cbm_registry_add(r, "save", "proj.lib.App.Gamma.save", "Function");
+
+    /* Each fully-qualified call routes to its own package. */
+    cbm_resolution_t a =
+        cbm_registry_resolve(r, "App::Alpha::save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(a.qualified_name, "proj.lib.App.Alpha.save");
+    ASSERT_STR_EQ(a.strategy, "qualified_suffix");
+
+    cbm_resolution_t b =
+        cbm_registry_resolve(r, "App::Beta::save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(b.qualified_name, "proj.lib.App.Beta.save");
+
+    cbm_resolution_t g =
+        cbm_registry_resolve(r, "App::Gamma::save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(g.qualified_name, "proj.lib.App.Gamma.save");
+
+    /* The dotted callee form (Go/Python/C#) disambiguates identically. */
+    cbm_resolution_t dotted =
+        cbm_registry_resolve(r, "App.Beta.save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(dotted.qualified_name, "proj.lib.App.Beta.save");
+    ASSERT_STR_EQ(dotted.strategy, "qualified_suffix");
+
+    /* A qualified callee whose tail matches NO candidate falls through to the
+     * existing bare-name scoring (never a qualified_suffix result). */
+    cbm_resolution_t nomatch =
+        cbm_registry_resolve(r, "Other::Pkg::save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_TRUE(!nomatch.strategy || strcmp(nomatch.strategy, "qualified_suffix") != 0);
+
+    /* A bare call stays ambiguous (no qualifier → no disambiguation signal). */
+    cbm_resolution_t bare =
+        cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "qualified_suffix") != 0);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* When two candidates share the same qualified tail, a qualified callee is
+ * genuinely ambiguous and must fall through to bare-name scoring rather than
+ * pick arbitrarily under the high-confidence qualified_suffix strategy. */
+TEST(resolve_qualified_ambiguous_tail_falls_through) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function");
+    cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function");
+
+    /* "Foo::Bar::run" tail matches BOTH candidates → not unique → fall through. */
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "Foo::Bar::run", "proj.svcA.Caller", NULL, NULL, 0);
+    ASSERT_TRUE(!res.strategy || strcmp(res.strategy, "qualified_suffix") != 0);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
@@ -278,6 +340,69 @@ TEST(resolve_import_map) {
     ASSERT_STR_EQ(res.qualified_name, "proj.pkg.worker.Process");
     ASSERT_STR_EQ(res.strategy, "import_map");
     ASSERT_TRUE(res.confidence >= 0.90);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Bare function call (no dot) routed through import_map. The candidate QN
+ * must be module_qn.callee, not module_qn — otherwise lookups fall through
+ * to name-based resolution and pick a same-named function from a different
+ * file. Regression for the @/lib/auth-style import case. */
+TEST(resolve_import_map_bare_function) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "requireAdmin", "proj.lib.authorization.requireAdmin", "Function");
+    /* Same name in another module — without the fix this is what gets picked. */
+    cbm_registry_add(r, "requireAdmin", "proj.lib.users.requireAdmin", "Function");
+
+    const char *keys[] = {"requireAdmin"};
+    const char *vals[] = {"proj.lib.authorization"};
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "requireAdmin", "proj.actions.settings", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.lib.authorization.requireAdmin");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Aliased bare import (`from m import f as g`, called as g()). The import-map
+ * value is the full symbol QN (IMPORTS edge targets the function node), and
+ * the callee at the site is the alias g — NOT f. Resolution must return the
+ * symbol directly instead of appending the alias (which yields m.f.g → miss).
+ * Regression for #875. */
+TEST(resolve_import_map_bare_alias) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function");
+    /* Import map: alias "_scan_bash" → FULL SYMBOL QN (not the module). */
+    const char *keys[] = {"_scan_bash"};
+    const char *vals[] = {"proj.security_scan.scan_bash"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "_scan_bash", "proj.hooks.pre_tool", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.security_scan.scan_bash");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Adversarial pin: when import_map already stores the def QN under the alias
+ * key, bare alias call must CALLS→def (not invent …M.bridge_execute). Behavior
+ * already on main via #875/#979; this locks the Yui G1 shape. */
+TEST(resolve_import_map_aliased_from_import) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function");
+    /* Alias ghost must not win if somehow registered. */
+    cbm_registry_add(r, "bridge_execute", "proj.services.satori_bridge.gate.bridge_execute",
+                     "Function");
+
+    const char *keys[] = {"bridge_execute"};
+    const char *vals[] = {"proj.services.satori_bridge.gate.execute"};
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "bridge_execute", "proj.services.yui_core.router", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.services.satori_bridge.gate.execute");
+    ASSERT_STR_EQ(res.strategy, "import_map");
 
     cbm_registry_free(r);
     PASS();
@@ -362,6 +487,31 @@ TEST(resolve_suffix_match) {
     ASSERT_STR_EQ(res.qualified_name, "proj.svcA.Process");
     ASSERT_STR_EQ(res.strategy, "suffix_match");
     ASSERT_TRUE(res.confidence >= 0.50 && res.confidence <= 0.60);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A name with more than REG_MAX_CANDIDATES (256) registered definitions is
+ * unresolvable by name alone: the candidate penalty floors its confidence to
+ * ~3/count (noise), while walking the candidate array per file dominated
+ * usage-resolution CPU on the Linux kernel ("flags"/"dev"/"list_head" have
+ * 4-7k definitions each). resolve must bail out with an empty result instead
+ * of scanning and emitting a near-zero-confidence edge. */
+TEST(resolve_caps_unresolvably_ambiguous_names) {
+    cbm_registry_t *r = cbm_registry_new();
+    for (int i = 0; i < 300; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
+        cbm_registry_add(r, "flags", qn, "Variable");
+    }
+    cbm_resolution_t res = cbm_registry_resolve(r, "flags", "proj.other.caller", NULL, NULL, 0);
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+
+    /* Same-module resolution still wins regardless of candidate count. */
+    res = cbm_registry_resolve(r, "flags", "proj.mod7", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.mod7.flags");
+    ASSERT_STR_EQ(res.strategy, "same_module");
 
     cbm_registry_free(r);
     PASS();
@@ -579,7 +729,273 @@ TEST(fuzzy_no_import_map_passthrough) {
     PASS();
 }
 
+/* ── Perl builtin guard (#459 follow-up: call-graph noise) ───────── */
+
+TEST(perl_builtin_set_recognizes_core_builtins) {
+    /* Representative core builtins from across the sorted set. */
+    ASSERT_TRUE(cbm_perl_is_builtin("push"));
+    ASSERT_TRUE(cbm_perl_is_builtin("shift"));
+    ASSERT_TRUE(cbm_perl_is_builtin("keys"));
+    ASSERT_TRUE(cbm_perl_is_builtin("sprintf"));
+    ASSERT_TRUE(cbm_perl_is_builtin("abs"));   /* first element */
+    ASSERT_TRUE(cbm_perl_is_builtin("write")); /* last element */
+    ASSERT_TRUE(cbm_perl_is_builtin("wantarray"));
+    PASS();
+}
+
+TEST(perl_builtin_set_rejects_project_subs) {
+    /* Genuine project sub names and edge inputs must NOT be flagged. */
+    ASSERT_FALSE(cbm_perl_is_builtin("helper"));
+    ASSERT_FALSE(cbm_perl_is_builtin("process_request"));
+    ASSERT_FALSE(cbm_perl_is_builtin("Push")); /* case-sensitive */
+    ASSERT_FALSE(cbm_perl_is_builtin(""));
+    ASSERT_FALSE(cbm_perl_is_builtin(NULL));
+    PASS();
+}
+
+TEST(perl_suppress_drops_weak_builtin_and_method_matches) {
+    /* #476: a builtin/method call that landed via a WEAK short-name strategy is
+     * generic-resolver noise and must be suppressed. */
+    ASSERT_TRUE(cbm_perl_suppress_generic_match(true, false, "push", "suffix_match"));
+    ASSERT_TRUE(cbm_perl_suppress_generic_match(true, false, "keys", "unique_name"));
+    ASSERT_TRUE(cbm_perl_suppress_generic_match(true, true, "commit", "suffix_match"));
+    ASSERT_TRUE(cbm_perl_suppress_generic_match(true, true, "log", "unique_name"));
+    PASS();
+}
+
+TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
+    /* #476: high-confidence strategies are kept so a genuine same-file/imported
+     * call to a builtin-named sub still resolves (criterion d). */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "log", "same_module"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "open", "import_map"));
+    /* import_map_suffix is a genuine import resolution (conf 0.85), not a weak
+     * short-name guess — a '::'-qualified call resolved this way must be kept. */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "Foo::Bar::m", "import_map_suffix"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "commit", "same_module"));
+    /* A genuine non-builtin function call is never suppressed (edge survives). */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "helper", "suffix_match"));
+    /* Non-Perl languages are never affected. */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(false, false, "push", "suffix_match"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(false, true, "commit", "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "push", NULL));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "commit", ""));
+    PASS();
+}
+
+TEST(cross_language_suffix_match_drops_py_vs_js) {
+    /* #725: two same-named symbols in different languages. suffix_match is the
+     * strategy that collapses them; unique_name is #1572 and must stay. */
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                         "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py",
+                                                         "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py",
+                                                         "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py",
+                                                          "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                          "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                          "same_module"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
+                                                          "import_map"));
+    /* JS/TS/TSX are one family. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "lib/util.ts",
+                                                          "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx",
+                                                          "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, NULL, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py",
+                                                          "suffix_match"));
+    PASS();
+}
+
+TEST(cross_language_ref_drops_go_vs_c) {
+    /* #1928: the USAGE/WRITES/READS analog of #725. Reference edges carry no
+     * import-closure evidence, so EVERY registry strategy is a bare-name
+     * guess and no strategy-level carve-out applies — the predicate takes no
+     * strategy at all. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.c"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "driver/mock.hpp"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_C, "pkg/events/event.go"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_PYTHON, "web/src/pages/Editor.js"));
+    /* Same language → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "pkg/state/state.go"));
+    /* C and C++ are one family: .h maps to CBM_LANG_CPP, and a .c file
+     * referencing its own header's declarations is not a boundary. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_C, "bpf/probe.h"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_CPP, "driver/compat.c"));
+    /* …but Go into a header is still a boundary. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.h"));
+    /* JS/TS/TSX/ArkTS are one family. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_JAVASCRIPT, "lib/util.ts"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx"));
+    /* Unknown caller/target language or no path → nothing to judge → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_COUNT, "store.py"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, NULL));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, ""));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "Makefile.inc.unknownext"));
+    PASS();
+}
+
+TEST(go_bare_ref_never_binds_field) {
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression. The extractor strips the
+     * receiver before the resolver runs (resolve_lhs_write_name writes the
+     * trailing name; is_reference_node records the inner field_identifier),
+     * so the selector-vs-bare distinction arrives as the recorded
+     * is_member_access signal, never as a dot in the reference text. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, false, "Field"));
+    /* The member half of a selector may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, true, "Field"));
+    /* Bare references to non-fields are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Function"));
+    /* Other languages reference their own members bare inside methods —
+     * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
+    PASS();
+}
+
+TEST(dynamic_suppress_drops_weak_method_matches) {
+    /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
+     * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
+     * The strategies that actually reach the guards are the registry's
+     * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
+     * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
+     * resolvers today) so a future wiring cannot silently reintroduce it. */
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "fuzzy"));
+    PASS();
+}
+
+TEST(dynamic_suppress_keeps_high_confidence_and_non_methods) {
+    /* Keep every receiver-/import-aware strategy. Because the PARALLEL resolver
+     * runs lsp_* strategies through this same guard variable, an explicit
+     * drop-list must never touch them — asserting the lsp_* keeps here is the
+     * regression guard for the "kills lsp edges" failure mode. The keep set
+     * enumerates the resolver's non-weak strategies: registry
+     * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
+     * {callee_suffix, service_pattern}, and lsp_*. */
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_ts_method"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_ts_local"));
+    /* A bare call (is_method=false) is a free-function call → never suppressed. */
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, false, "suffix_match"));
+    /* Languages outside the caller's guard set are never affected. */
+    ASSERT_FALSE(cbm_suppress_weak_member_match(false, true, "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, ""));
+    PASS();
+}
+
+TEST(local_binding_suppress_drops_weak_shadowed_bare_calls) {
+    /* A bare `run()` whose callee is a parameter of an enclosing scope cannot be
+     * the module-level `run`, so a weak short-name match fabricates the edge. */
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "fuzzy"));
+    PASS();
+}
+
+TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies) {
+    /* THE RECALL PIN. A bare call to a genuine module-level function is NOT
+     * locally bound, so it is never suppressed — whatever the callee is spelled.
+     * This is the assertion a name-keyed guard (get/run/execute) would fail: it
+     * would drop these purely because of how the callee reads. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "field_type_hint"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "fuzzy"));
+    /* Every receiver-/import-aware strategy is kept even when shadowed. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_py_method"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_direct"));
+    /* Languages outside the caller's gate are never affected. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(false, true, "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, ""));
+    PASS();
+}
+
+TEST(weak_call_guards_share_one_drop_list) {
+    /* The member guard and the local-binding guard must agree on what "weak"
+     * means. They share a single static predicate for exactly this reason; if
+     * someone re-inlines one of the lists and edits only that copy, the two
+     * guards start disagreeing and this test catches it at the contract level
+     * rather than in a corpus months later. */
+    static const char *const strategies[] = {"suffix_match",
+                                             "unique_name",
+                                             "field_type_hint",
+                                             "fuzzy",
+                                             "same_module",
+                                             "import_map",
+                                             "import_map_suffix",
+                                             "qualified_suffix",
+                                             "callee_suffix",
+                                             "service_pattern",
+                                             "lsp_cross",
+                                             "lsp_ts_method",
+                                             "lsp_py_method",
+                                             "lsp_direct",
+                                             "",
+                                             NULL};
+    for (int i = 0; strategies[i] != NULL; i++) {
+        bool member = cbm_suppress_weak_member_match(true, true, strategies[i]);
+        bool binding = cbm_suppress_weak_local_binding_call(true, true, strategies[i]);
+        if (member != binding) {
+            printf("  drop-list divergence on strategy \"%s\": member=%d binding=%d\n",
+                   strategies[i], member, binding);
+        }
+        ASSERT_EQ(member, binding);
+    }
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
+
+/* Method call THROUGH an imported symbol that is itself an indexed node
+ * (`from m import sig; sig.send()`). The import-map value is the symbol QN
+ * and the callee carries a suffix — resolution must return symbol.send, NOT
+ * the bare symbol node. The #979 direct-hit early return swallowed the
+ * suffix whenever the base symbol existed as an exact node, degrading
+ * django-scale graphs by ~11K CALLS/TESTS edges (e.g. every
+ * `user_logged_in.send(...)` bound to the signal VARIABLE instead of
+ * Signal.send). Regression guard for #1000. */
+TEST(resolve_import_map_alias_with_suffix_hits_method) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable");
+    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method");
+    const char *keys[] = {"user_logged_in"};
+    const char *vals[] = {"proj.auth.signals.user_logged_in"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "user_logged_in.send", "proj.auth.views", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.auth.signals.user_logged_in.send");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
 
 SUITE(registry) {
     /* FQN */
@@ -609,7 +1025,13 @@ SUITE(registry) {
     RUN_TEST(registry_no_duplicates);
     /* Resolution */
     RUN_TEST(resolve_same_module);
+    RUN_TEST(resolve_qualified_disambiguates_same_name);
+    RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
     RUN_TEST(resolve_import_map);
+    RUN_TEST(resolve_import_map_bare_function);
+    RUN_TEST(resolve_import_map_bare_alias);
+    RUN_TEST(resolve_import_map_aliased_from_import);
+    RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
@@ -619,6 +1041,7 @@ SUITE(registry) {
     RUN_TEST(confidence_band_speculative);
     /* Suffix match + import map suffix */
     RUN_TEST(resolve_suffix_match);
+    RUN_TEST(resolve_caps_unresolvably_ambiguous_names);
     RUN_TEST(resolve_import_map_suffix);
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);
@@ -635,4 +1058,18 @@ SUITE(registry) {
     RUN_TEST(fuzzy_resolve_confidence_distance);
     RUN_TEST(fuzzy_penalty_unreachable_import);
     RUN_TEST(fuzzy_no_import_map_passthrough);
+
+    /* Perl builtin guard */
+    RUN_TEST(perl_builtin_set_recognizes_core_builtins);
+    RUN_TEST(perl_builtin_set_rejects_project_subs);
+    RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
+    RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(cross_language_ref_drops_go_vs_c);
+    RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(dynamic_suppress_drops_weak_method_matches);
+    RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(local_binding_suppress_drops_weak_shadowed_bare_calls);
+    RUN_TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies);
+    RUN_TEST(weak_call_guards_share_one_drop_list);
 }

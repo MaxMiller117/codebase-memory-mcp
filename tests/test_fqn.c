@@ -6,18 +6,19 @@
  */
 #include "test_framework.h"
 #include "../src/pipeline/pipeline.h"
+#include "../src/foundation/str_util.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 /* ── Helper: assert FQN result and free ────────────────────────── */
 
-#define ASSERT_FQN(expr, expected)    \
-    do {                              \
-        char *_r = (expr);            \
-        ASSERT_NOT_NULL(_r);          \
-        ASSERT_STR_EQ(_r, expected);  \
-        free(_r);                     \
+#define ASSERT_FQN(expr, expected)   \
+    do {                             \
+        char *_r = (expr);           \
+        ASSERT_NOT_NULL(_r);         \
+        ASSERT_STR_EQ(_r, expected); \
+        free(_r);                    \
     } while (0)
 
 /* ================================================================
@@ -51,8 +52,126 @@ TEST(fqn_compute_basic_c) {
     PASS();
 }
 
+/* #1077/#964: File-node QNs (name=="__file__") must preserve the FULL filename
+ * so sibling files sharing a stem get DISTINCT nodes. Extension stripping is
+ * kept for module/symbol QNs (name!=__file__) — load-bearing for C/C++
+ * declaration↔definition resolution. */
+TEST(fqn_file_qn_preserves_dotfile_variants_issue1077) {
+    /* .env / .env.local / .env.production all stripped to ".env" before,
+     * colliding so only one File node survived per directory. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env", "__file__"), "proj..env.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env.local", "__file__"),
+               "proj..env.local.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env.production", "__file__"),
+               "proj..env.production.__file__");
+    PASS();
+}
+
+TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964) {
+    /* NodeController.h and NodeController.cpp both stripped to
+     * "NodeController", so the header's File node was merged into the .cpp's. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "NodeController.h", "__file__"),
+               "proj.NodeController.h.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "NodeController.cpp", "__file__"),
+               "proj.NodeController.cpp.__file__");
+    PASS();
+}
+
+TEST(fqn_module_qn_still_strips_extension) {
+    /* The MODULE/symbol QN keeps stripping — unchanged by the File-QN fix. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "core.c", "init"), "proj.core.init");
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "NodeController.cpp"), "proj.NodeController");
+    PASS();
+}
+
+TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682) {
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import(
+            "packages/api/src/modules/consumer/consumer.service.ts", "../featureX/featureX.engine"),
+        "packages/api/src/modules/featureX/featureX.engine");
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import("packages/api/src/modules/moduleA/moduleA.service.ts",
+                                             "../moduleQ/moduleQ.service"),
+        "packages/api/src/modules/moduleQ/moduleQ.service");
+    ASSERT_FQN(cbm_pipeline_resolve_relative_import(
+                   "packages/api/src/modules/moduleA/moduleA.service.ts", "./create-thing.dto"),
+               "packages/api/src/modules/moduleA/create-thing.dto");
+    PASS();
+}
+
 TEST(fqn_compute_basic_rs) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib.rs", "new"), "proj.lib.new");
+    PASS();
+}
+
+TEST(fqn_compute_file_sibling_distinct) {
+    char *ts = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "__file__");
+    char *html = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.html", "__file__");
+    char *scss = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.scss", "__file__");
+    ASSERT_NOT_NULL(ts);
+    ASSERT_NOT_NULL(html);
+    ASSERT_NOT_NULL(scss);
+    ASSERT_STR_NEQ(ts, html);
+    ASSERT_STR_NEQ(ts, scss);
+    ASSERT_STR_NEQ(html, scss);
+    free(ts);
+    free(html);
+    free(scss);
+    PASS();
+}
+
+TEST(fqn_compute_symbol_still_strips) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "BadgeComponent"),
+               "proj.app.badge.badge.component.BadgeComponent");
+    PASS();
+}
+
+TEST(fqn_module_siblings_still_share) {
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "app/badge/badge.component.ts"),
+               "proj.app.badge.badge.component");
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "app/badge/badge.component.html"),
+               "proj.app.badge.badge.component");
+    PASS();
+}
+
+/* #769: exact __file__ QNs for component siblings. */
+TEST(fqn_compute_file_sibling_exact) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "__file__"),
+               "proj.app.badge.badge.component.ts.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.html", "__file__"),
+               "proj.app.badge.badge.component.html.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.scss", "__file__"),
+               "proj.app.badge.badge.component.scss.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_multi_extension) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.spec.ts", "__file__"),
+               "proj.app.badge.badge.spec.ts.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "archive.tar.gz", "__file__"),
+               "proj.archive.tar.gz.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_no_extension) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "__file__"),
+               "proj.Makefile.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "LICENSE", "__file__"),
+               "proj.LICENSE.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_dotfile) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".gitignore", "__file__"),
+               "proj..gitignore.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "config/.env", "__file__"),
+               "proj.config..env.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_index_ts) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/index.ts", "__file__"),
+           "proj.app.index.ts.__file__");
     PASS();
 }
 
@@ -65,14 +184,12 @@ TEST(fqn_compute_nested_two_levels) {
 }
 
 TEST(fqn_compute_nested_three_levels) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/file.py", "Class"),
-               "proj.a.b.c.file.Class");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/file.py", "Class"), "proj.a.b.c.file.Class");
     PASS();
 }
 
 TEST(fqn_compute_nested_deep) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/d/e/f/g.ts", "fn"),
-               "proj.a.b.c.d.e.f.g.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/d/e/f/g.ts", "fn"), "proj.a.b.c.d.e.f.g.fn");
     PASS();
 }
 
@@ -80,86 +197,73 @@ TEST(fqn_compute_nested_deep) {
 
 TEST(fqn_compute_init_py_with_name) {
     /* __init__ stripped when name is provided */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "MyClass"),
-               "proj.pkg.MyClass");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "MyClass"), "proj.pkg.MyClass");
     PASS();
 }
 
 TEST(fqn_compute_init_py_without_name) {
     /* __init__ kept when no name (module QN for the file itself) */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", NULL),
-               "proj.pkg.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", NULL), "proj.pkg.__init__");
     PASS();
 }
 
 TEST(fqn_compute_init_py_empty_name) {
     /* Empty string name also keeps __init__ */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", ""),
-               "proj.pkg.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", ""), "proj.pkg.__init__");
     PASS();
 }
 
 TEST(fqn_compute_init_py_nested) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/__init__.py", "Foo"),
-               "proj.a.b.Foo");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/__init__.py", "Foo"), "proj.a.b.Foo");
     PASS();
 }
 
 TEST(fqn_compute_init_py_root) {
     /* __init__.py at root with name */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", "X"),
-               "proj.X");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", "X"), "proj.X");
     PASS();
 }
 
 TEST(fqn_compute_init_py_root_no_name) {
     /* __init__.py at root without name -- only project + __init__ (seg_count=2 > 1) */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", NULL),
-               "proj.__init__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "__init__.py", NULL), "proj.__init__");
     PASS();
 }
 
 /* ── JS/TS index files ────────────────────────────────────────── */
 
 TEST(fqn_compute_index_js_with_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", "render"),
-               "proj.pkg.render");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", "render"), "proj.pkg.render");
     PASS();
 }
 
 TEST(fqn_compute_index_js_without_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", NULL),
-               "proj.pkg.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/index.js", NULL), "proj.pkg.index");
     PASS();
 }
 
 TEST(fqn_compute_index_ts_with_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", "App"),
-               "proj.src.App");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", "App"), "proj.src.App");
     PASS();
 }
 
 TEST(fqn_compute_index_ts_without_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", NULL),
-               "proj.src.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/index.ts", NULL), "proj.src.index");
     PASS();
 }
 
 TEST(fqn_compute_index_ts_empty_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib/index.ts", ""),
-               "proj.lib.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib/index.ts", ""), "proj.lib.index");
     PASS();
 }
 
 TEST(fqn_compute_index_root_with_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", "main"),
-               "proj.main");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", "main"), "proj.main");
     PASS();
 }
 
 TEST(fqn_compute_index_root_no_name) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", NULL),
-               "proj.index");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "index.js", NULL), "proj.index");
     PASS();
 }
 
@@ -208,20 +312,17 @@ TEST(fqn_compute_null_project_null_path) {
 /* ── Backslash paths (Windows) ────────────────────────────────── */
 
 TEST(fqn_compute_backslash_simple) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src\\main.go", "run"),
-               "proj.src.main.run");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src\\main.go", "run"), "proj.src.main.run");
     PASS();
 }
 
 TEST(fqn_compute_backslash_nested) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a\\b\\c\\file.py", "X"),
-               "proj.a.b.c.file.X");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a\\b\\c\\file.py", "X"), "proj.a.b.c.file.X");
     PASS();
 }
 
 TEST(fqn_compute_backslash_mixed) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b\\c/d.ts", "fn"),
-               "proj.a.b.c.d.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b\\c/d.ts", "fn"), "proj.a.b.c.d.fn");
     PASS();
 }
 
@@ -229,14 +330,12 @@ TEST(fqn_compute_backslash_mixed) {
 
 TEST(fqn_compute_double_ext) {
     /* Only last extension stripped: foo.test.ts -> foo.test */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "foo.test.ts", "bar"),
-               "proj.foo.test.bar");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "foo.test.ts", "bar"), "proj.foo.test.bar");
     PASS();
 }
 
 TEST(fqn_compute_spec_ext) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "util.spec.js", "it"),
-               "proj.util.spec.it");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "util.spec.js", "it"), "proj.util.spec.it");
     PASS();
 }
 
@@ -244,29 +343,25 @@ TEST(fqn_compute_spec_ext) {
 
 TEST(fqn_compute_leading_slash) {
     /* Leading slash produces empty segment which is skipped */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "/src/main.go", "fn"),
-               "proj.src.main.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "/src/main.go", "fn"), "proj.src.main.fn");
     PASS();
 }
 
 TEST(fqn_compute_trailing_slash) {
     /* Trailing slash: path becomes empty after last /, extension strip is no-op */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/", "fn"),
-               "proj.src.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/", "fn"), "proj.src.fn");
     PASS();
 }
 
 TEST(fqn_compute_double_slash) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a//b.go", "fn"),
-               "proj.a.b.fn");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a//b.go", "fn"), "proj.a.b.fn");
     PASS();
 }
 
 /* ── No extension ─────────────────────────────────────────────── */
 
 TEST(fqn_compute_no_ext) {
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "target"),
-               "proj.Makefile.target");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "target"), "proj.Makefile.target");
     PASS();
 }
 
@@ -288,8 +383,7 @@ TEST(fqn_compute_init_not_stripped) {
 
 TEST(fqn_compute_index2_not_stripped) {
     /* "indexer" is NOT "index", should not be stripped */
-    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/indexer.ts", "F"),
-               "proj.pkg.indexer.F");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/indexer.ts", "F"), "proj.pkg.indexer.F");
     PASS();
 }
 
@@ -397,35 +491,30 @@ TEST(fqn_folder_double_slash) {
  * ================================================================ */
 
 TEST(project_name_unix_path) {
-    ASSERT_FQN(cbm_project_name_from_path("/Users/dev/my-project"),
-               "Users-dev-my-project");
+    ASSERT_FQN(cbm_project_name_from_path("/Users/dev/my-project"), "Users-dev-my-project");
     PASS();
 }
 
 TEST(project_name_windows_path) {
-    ASSERT_FQN(cbm_project_name_from_path("C:\\Users\\dev\\project"),
-               "C-Users-dev-project");
+    ASSERT_FQN(cbm_project_name_from_path("C:\\Users\\dev\\project"), "C-Users-dev-project");
     PASS();
 }
 
 TEST(project_name_with_colons) {
     /* Colons replaced with dashes (e.g., C: drive) */
-    ASSERT_FQN(cbm_project_name_from_path("C:/dev/proj"),
-               "C-dev-proj");
+    ASSERT_FQN(cbm_project_name_from_path("C:/dev/proj"), "C-dev-proj");
     PASS();
 }
 
 TEST(project_name_multiple_slashes) {
     /* Consecutive slashes become one dash */
-    ASSERT_FQN(cbm_project_name_from_path("/home///user//code"),
-               "home-user-code");
+    ASSERT_FQN(cbm_project_name_from_path("/home///user//code"), "home-user-code");
     PASS();
 }
 
 TEST(project_name_leading_trailing_slashes) {
     /* Leading/trailing dashes trimmed */
-    ASSERT_FQN(cbm_project_name_from_path("/foo/bar/"),
-               "foo-bar");
+    ASSERT_FQN(cbm_project_name_from_path("/foo/bar/"), "foo-bar");
     PASS();
 }
 
@@ -452,21 +541,18 @@ TEST(project_name_single_segment) {
 
 TEST(project_name_mixed_separators) {
     /* Mix of forward slash, backslash, colon */
-    ASSERT_FQN(cbm_project_name_from_path("C:\\Users/dev:proj"),
-               "C-Users-dev-proj");
+    ASSERT_FQN(cbm_project_name_from_path("C:\\Users/dev:proj"), "C-Users-dev-proj");
     PASS();
 }
 
 TEST(project_name_already_dashed) {
     /* Dashes are preserved, not collapsed unless from separator conversion */
-    ASSERT_FQN(cbm_project_name_from_path("/my-great-project"),
-               "my-great-project");
+    ASSERT_FQN(cbm_project_name_from_path("/my-great-project"), "my-great-project");
     PASS();
 }
 
 TEST(project_name_deep_path) {
-    ASSERT_FQN(cbm_project_name_from_path("/a/b/c/d/e/f/g"),
-               "a-b-c-d-e-f-g");
+    ASSERT_FQN(cbm_project_name_from_path("/a/b/c/d/e/f/g"), "a-b-c-d-e-f-g");
     PASS();
 }
 
@@ -486,6 +572,100 @@ TEST(project_name_consecutive_colons) {
     PASS();
 }
 
+/* issue #349: every derived project name must satisfy cbm_validate_project_name,
+ * else the project is indexed + shown by list_projects but resolve_store rejects
+ * the name → index_status/search_graph report project-not-found. */
+TEST(project_name_always_validator_safe_issue349) {
+    static const char *const paths[] = {
+        "/home/u/my project", /* space */
+        "/srv/app@v2",        /* @ */
+        "/data/cxx/proj+1",   /* + */
+        "/x/.hidden/repo",    /* leading-dot segment */
+        "/x/a..b/repo",       /* .. sequence */
+        "/Users/dev/caf\xc3\xa9"
+        "app",                       /* non-ASCII (UTF-8) bytes */
+        "C:\\Work\\Big Repo (2024)", /* space + parens + backslash */
+        NULL,
+    };
+    for (int i = 0; paths[i]; i++) {
+        char *name = cbm_project_name_from_path(paths[i]);
+        ASSERT_NOT_NULL(name);
+        ASSERT_TRUE(cbm_validate_project_name(name));
+        free(name);
+    }
+    PASS();
+}
+
+TEST(project_name_encodes_unicode_segments_issue571) {
+    char *got = cbm_project_name_from_path(
+        "/Users/yunxin/Desktop/\xe5\xbc\x80\xe5\x8f\x91/"
+        "\xe5\x90\x8e\xe7\xab\xaf/"
+        "\xe4\xbf\xa1\xe7\xa7\x9f\xe9\xa3\x8e\xe6\x8e\xa7\xe9\x80\x9a\xe5\x90\x8e\xe7\xab\xaf");
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "Users-yunxin-Desktop-e5bc80e58f91-e5908ee7abaf-"
+                       "e4bfa1e7a79fe9a38ee68ea7e9809ae5908ee7abaf");
+    ASSERT_TRUE(cbm_validate_project_name(got));
+    free(got);
+    PASS();
+}
+
+/* issue #624: #571 preserves non-ASCII path segments by hex-encoding each byte
+ * (1 byte -> 2 hex chars), so a DEEP non-ASCII path triples in length and can
+ * blow past the filesystem's 255-byte filename-component limit. Then
+ * "<cache>/<name>.db" is un-openable (ENAMETOOLONG). The derived name must be
+ * length-capped (with a hash suffix that disambiguates otherwise-identical
+ * prefixes) while staying validator-safe — and SHORT names must NOT drift. */
+#define FQN_CAP_UNDER_TEST 200
+TEST(project_name_length_capped_issue624) {
+    /* 开 = U+5F00, UTF-8 "\xe5\xbc\x80" (3 bytes -> 6 hex chars). 60 copies makes
+     * the raw hex-encoded name ~360 chars, well past the 200-byte cap. */
+    static const char KAI[] = "\xe5\xbc\x80";
+    char deepA[512];
+    char deepB[512];
+    const char *prefix = "/Users/dev/";
+    size_t p = strlen(prefix);
+    memcpy(deepA, prefix, p);
+    for (int i = 0; i < 60; i++) {
+        memcpy(deepA + p, KAI, 3);
+        p += 3;
+    }
+    /* deepB shares the entire deep prefix and differs ONLY in the trailing seg */
+    memcpy(deepB, deepA, p);
+    memcpy(deepA + p, "/alpha", 7); /* includes NUL */
+    memcpy(deepB + p, "/omega", 7);
+
+    char *nameA = cbm_project_name_from_path(deepA);
+    char *nameB = cbm_project_name_from_path(deepB);
+    ASSERT_NOT_NULL(nameA);
+    ASSERT_NOT_NULL(nameB);
+
+    /* (a) capped: name must fit within the filename-component budget */
+    ASSERT_LTE(strlen(nameA), FQN_CAP_UNDER_TEST);
+    ASSERT_LTE(strlen(nameB), FQN_CAP_UNDER_TEST);
+    /* (b) still a valid project name (resolve_store must accept it) */
+    ASSERT_TRUE(cbm_validate_project_name(nameA));
+    ASSERT_TRUE(cbm_validate_project_name(nameB));
+    /* (c) two deep paths differing only in the trailing segment must NOT
+     * collide after capping — the hash suffix disambiguates them. */
+    ASSERT_STR_NEQ(nameA, nameB);
+
+    free(nameA);
+    free(nameB);
+
+    /* Short CJK path (the issue #571 case) must be UNCHANGED — no drift. */
+    char *shortName = cbm_project_name_from_path(
+        "/Users/yunxin/Desktop/\xe5\xbc\x80\xe5\x8f\x91/"
+        "\xe5\x90\x8e\xe7\xab\xaf/"
+        "\xe4\xbf\xa1\xe7\xa7\x9f\xe9\xa3\x8e\xe6\x8e\xa7\xe9\x80\x9a\xe5\x90\x8e\xe7\xab\xaf");
+    ASSERT_NOT_NULL(shortName);
+    ASSERT_LTE(strlen(shortName), FQN_CAP_UNDER_TEST);
+    ASSERT_STR_EQ(shortName, "Users-yunxin-Desktop-e5bc80e58f91-e5908ee7abaf-"
+                             "e4bfa1e7a79fe9a38ee68ea7e9809ae5908ee7abaf");
+    free(shortName);
+
+    PASS();
+}
+
 /* ================================================================
  * Suite
  * ================================================================ */
@@ -497,7 +677,19 @@ SUITE(fqn) {
     RUN_TEST(fqn_compute_basic_ts);
     RUN_TEST(fqn_compute_basic_js);
     RUN_TEST(fqn_compute_basic_c);
+    RUN_TEST(fqn_file_qn_preserves_dotfile_variants_issue1077);
+    RUN_TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964);
+    RUN_TEST(fqn_module_qn_still_strips_extension);
+    RUN_TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682);
     RUN_TEST(fqn_compute_basic_rs);
+    RUN_TEST(fqn_compute_file_sibling_distinct);
+    RUN_TEST(fqn_compute_symbol_still_strips);
+    RUN_TEST(fqn_module_siblings_still_share);
+    RUN_TEST(fqn_compute_file_sibling_exact);
+    RUN_TEST(fqn_compute_file_multi_extension);
+    RUN_TEST(fqn_compute_file_no_extension);
+    RUN_TEST(fqn_compute_file_dotfile);
+    RUN_TEST(fqn_compute_file_index_ts);
 
     /* fqn_compute: nested paths */
     RUN_TEST(fqn_compute_nested_two_levels);
@@ -586,6 +778,9 @@ SUITE(fqn) {
     RUN_TEST(project_name_mixed_separators);
     RUN_TEST(project_name_already_dashed);
     RUN_TEST(project_name_deep_path);
+    RUN_TEST(project_name_always_validator_safe_issue349);
+    RUN_TEST(project_name_encodes_unicode_segments_issue571);
+    RUN_TEST(project_name_length_capped_issue624);
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);
     RUN_TEST(project_name_consecutive_colons);

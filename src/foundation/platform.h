@@ -31,6 +31,52 @@ static inline void *safe_realloc(void *ptr, size_t size) {
     return tmp;
 }
 
+/* Safe free: frees and NULLs a pointer to prevent double-free / use-after-free.
+ * Use via the safe_free() macro so the caller's pointer is actually cleared. */
+static inline void safe_free_impl(void **pp) {
+    if (pp && *pp) {
+        free(*pp);
+        *pp = NULL;
+    }
+}
+#define safe_free(ptr) safe_free_impl((void **)(void *)&(ptr))
+
+/* Safe const string free: frees a const char* and NULLs it.
+ * Casts away const so callers don't repeat the (void *) dance. */
+static inline void safe_str_free(const char **sp) {
+    if (sp && *sp) {
+        free((void *)*sp);
+        *sp = NULL;
+    }
+}
+
+/* Safe buffer free: frees a heap array and zeros its element count.
+ * Use for dynamic arrays paired with a size_t count. */
+static inline void safe_buf_free_impl(void **buf, size_t *count) {
+    if (buf && *buf) {
+        free(*buf);
+        *buf = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+}
+#define safe_buf_free(buf, countp) safe_buf_free_impl((void **)(void *)&(buf), (countp))
+
+/* Safe grow: doubles capacity and reallocs when count reaches cap.
+ * Note: uses safe_realloc which frees the old buffer on failure, so this is
+ * only appropriate for arrays whose elements don't own additional heap memory.
+ * For arrays of heap-allocated pointers, prefer a manual realloc+cleanup pattern.
+ * Usage: safe_grow(arr, count, cap, growth_factor)
+ * After the call, arr is the new buffer (NULL on OOM). */
+#define safe_grow(arr, n, cap, factor)                                   \
+    do {                                                                 \
+        if ((size_t)(n) >= (size_t)(cap)) {                              \
+            (cap) *= (factor);                                           \
+            (arr) = safe_realloc((arr), (size_t)(cap) * sizeof(*(arr))); \
+        }                                                                \
+    } while (0)
+
 /* ── Memory mapping ────────────────────────────────────────────── */
 
 /* Map a file read-only into memory. Returns NULL on error.
@@ -48,6 +94,13 @@ uint64_t cbm_now_ns(void);
 /* Monotonic millisecond timestamp. */
 uint64_t cbm_now_ms(void);
 
+/* Symbolic name for an errno value ("ENOSPC"), or the decimal number when the
+ * value is not in the portable table. The fallback lives in thread-local
+ * storage; copy it before the next call on the same thread. Diagnostics only:
+ * a log line that says `errno=ENOSPC path=...` is a one-line diagnosis where
+ * `stage=pending_publication` alone cost a reporter hours (#1828). */
+const char *cbm_errno_name(int error);
+
 /* ── System info ───────────────────────────────────────────────── */
 
 /* Number of available CPU cores. */
@@ -63,6 +116,10 @@ typedef struct {
 /* Query system information. Results are cached after first call. */
 cbm_system_info_t cbm_system_info(void);
 
+/* Physical memory the system could hand out right now, or 0 when the platform
+ * cannot answer. NOT cached - it changes during a run, which is the point. */
+size_t cbm_system_available_ram(void);
+
 /* Recommended worker count for parallel indexing.
  * initial=true:  all cores (user is waiting for initial index)
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
@@ -74,6 +131,18 @@ int cbm_default_worker_count(bool initial);
  * Returns buf on success, or fallback if the variable is unset.
  * Returns NULL when the variable is unset and fallback is NULL. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
+
+/* Read an environment variable as a whole number.
+ *
+ * Answers true only when the variable is set, is not empty, and reads cleanly
+ * from its first character to its last. Anything else — a typo, a trailing
+ * unit such as "30s", a leading or trailing space, or a number too large for a
+ * long — answers false and leaves *out untouched, so the caller picks its own
+ * fallback and can say that it did.
+ *
+ * This exists because atoi and atol answer 0 for text they cannot read, and 0
+ * is a real setting at every call site in this project. */
+bool cbm_env_long(const char *name, long *out);
 
 /* ── Home directory ─────────────────────────────────────────────── */
 

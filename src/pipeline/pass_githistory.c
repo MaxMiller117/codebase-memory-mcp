@@ -87,6 +87,7 @@ typedef struct {
     char **files;
     int count;
     int cap;
+    long long timestamp; /* unix epoch of this commit; 0 when unknown */
 } commit_t;
 
 static void commit_add_file(commit_t *c, const char *file) {
@@ -104,129 +105,30 @@ static void commit_free(commit_t *c) {
     free(c->files);
 }
 
-/* ── libgit2-based git log parsing (preferred) ────────────────────── */
-
-#ifdef HAVE_LIBGIT2
-#include <git2.h>
-#include <time.h>
+/* ── git log parsing (popen "git log") ────────────────────────────── */
 
 static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) {
     *out = NULL;
     *out_count = 0;
 
-    git_libgit2_init();
-
-    git_repository *repo = NULL;
-    if (git_repository_open(&repo, repo_path) != 0) {
-        git_libgit2_shutdown();
-        return CBM_NOT_FOUND;
-    }
-
-    /* Walk from HEAD, sorted chronologically */
-    git_revwalk *walker = NULL;
-    if (git_revwalk_new(&walker, repo) != 0) {
-        git_repository_free(repo);
-        git_libgit2_shutdown();
-        return CBM_NOT_FOUND;
-    }
-    git_revwalk_sorting(walker, GIT_SORT_TIME);
-    git_revwalk_push_head(walker);
-
-    /* 1 year cutoff, max 10k commits */
-    time_t cutoff = time(NULL) - (365L * 24 * 3600);
-    int max_commits = 10000;
-
-    int cap = CBM_SZ_64;
-    commit_t *commits = malloc(cap * sizeof(commit_t));
-    int count = 0;
-
-    git_oid oid;
-    while (git_revwalk_next(&oid, walker) == 0 && count < max_commits) {
-        git_commit *commit = NULL;
-        if (git_commit_lookup(&commit, repo, &oid) != 0) {
-            continue;
-        }
-
-        /* Check if commit is within the 6-month window */
-        git_time_t ct = git_commit_time(commit);
-        if ((time_t)ct < cutoff) {
-            git_commit_free(commit);
-            break; /* sorted by time — all subsequent commits are older */
-        }
-
-        /* Get commit tree and parent tree for diff */
-        git_tree *tree = NULL;
-        git_tree *parent_tree = NULL;
-        git_commit_tree(&tree, commit);
-
-        unsigned int nparents = git_commit_parentcount(commit);
-        if (nparents > 0) {
-            git_commit *parent = NULL;
-            if (git_commit_parent(&parent, commit, 0) == 0) {
-                git_commit_tree(&parent_tree, parent);
-                git_commit_free(parent);
-            }
-        }
-
-        /* Diff parent_tree → tree to find changed files */
-        git_diff *diff = NULL;
-        git_diff_options diff_opts;
-        git_diff_options_init(&diff_opts, GIT_DIFF_OPTIONS_VERSION);
-        if (git_diff_tree_to_tree(&diff, repo, parent_tree, tree, &diff_opts) == 0) {
-            commit_t current = {0};
-
-            size_t ndeltas = git_diff_num_deltas(diff);
-            for (size_t d = 0; d < ndeltas; d++) {
-                const git_diff_delta *delta = git_diff_get_delta(diff, d);
-                const char *path = delta->new_file.path;
-                if (path && cbm_is_trackable_file(path)) {
-                    commit_add_file(&current, path);
-                }
-            }
-
-            if (current.count > 0) {
-                if (count >= cap) {
-                    cap *= PAIR_LEN;
-                    commits = safe_realloc(commits, cap * sizeof(commit_t));
-                }
-                commits[count++] = current;
-            } else {
-                commit_free(&current);
-            }
-            git_diff_free(diff);
-        }
-
-        if (parent_tree) {
-            git_tree_free(parent_tree);
-        }
-        git_tree_free(tree);
-        git_commit_free(commit);
-    }
-
-    git_revwalk_free(walker);
-    git_repository_free(repo);
-    git_libgit2_shutdown();
-
-    *out = commits;
-    *out_count = count;
-    return 0;
-}
-
-#else /* !HAVE_LIBGIT2 — popen fallback */
-
-static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) {
-    *out = NULL;
-    *out_count = 0;
-
-    if (!cbm_validate_shell_arg(repo_path)) {
+    if (!cbm_validate_shell_path_arg(repo_path)) {
         return CBM_NOT_FOUND;
     }
 
     char cmd[CBM_SZ_1K];
+#ifdef _WIN32
+    /* cmd.exe does not recognize single quotes, and '/dev/null' is a POSIX path. */
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    /* git -C "<path>" works on both cmd.exe and POSIX shells. Double quotes are
+     * safe here because cbm_validate_shell_arg (above) rejects ", $, `, \ and the
+     * other shell metacharacters that would otherwise be active inside them. */
     snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git log --name-only --pretty=format:COMMIT:%%H "
-             "--since='1 year ago' --max-count=10000 2>/dev/null",
-             repo_path);
+             "git -C \"%s\" log --name-only --pretty=format:COMMIT:%%H:%%ct "
+             "--since=\"1 year ago\" --max-count=10000 2>%s",
+             repo_path, null_dev);
 
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
@@ -257,6 +159,12 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
                 commits[count++] = current;
                 memset(&current, 0, sizeof(current));
             }
+            /* Parse the unix timestamp from "COMMIT:<hash>:<unix_epoch>".
+             * Older callers / stripped-down git output without %ct land on 0. */
+            const char *hash_end = strchr(line + SLEN("COMMIT:"), ':');
+            if (hash_end) {
+                current.timestamp = strtoll(hash_end + 1, NULL, 10);
+            }
             continue;
         }
 
@@ -280,12 +188,10 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     return 0;
 }
 
-#endif /* HAVE_LIBGIT2 */
-
 /* Callback to free hash table entries. */
 static void free_counter(const char *key, void *val, void *ud) {
     (void)ud;
-    free((void *)key);
+    safe_str_free(&key);
     free(val);
 }
 
@@ -294,6 +200,7 @@ static void free_counter(const char *key, void *val, void *ud) {
 /* Context for collect_coupling_result callback. */
 typedef struct {
     CBMHashTable *file_counts;
+    CBMHashTable *pair_timestamps; /* pair_key → long long*: max commit ts */
     cbm_change_coupling_t *out;
     int out_count;
     int max_out;
@@ -344,12 +251,18 @@ static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     snprintf(cc->file_b, sizeof(cc->file_b), "%s", file_b);
     cc->co_change_count = co_count;
     cc->coupling_score = score;
+    long long *ts = cbm_ht_get(cctx->pair_timestamps, pair_key);
+    cc->last_co_change = ts ? *ts : 0;
 }
 
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
                                 cbm_change_coupling_t *out, int max_out) {
     CBMHashTable *file_counts = cbm_ht_create(CBM_SZ_1K);
     CBMHashTable *pair_counts = cbm_ht_create(CBM_SZ_2K);
+    /* Parallel table mapping pair_key → max commit timestamp seen for that
+     * pair, so the resulting edge can carry last_co_change. The pair_counts
+     * table consumes its key on insert; pair_timestamps gets its own copy. */
+    CBMHashTable *pair_timestamps = cbm_ht_create(CBM_SZ_2K);
 
     for (int c = 0; c < commit_count; c++) {
         if (commits[c].count > GH_MAX_FILES) {
@@ -378,7 +291,8 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                 }
                 size_t la = strlen(a);
                 size_t lb = strlen(b);
-                char *pk = malloc(la + SKIP_ONE + lb + SKIP_ONE);
+                size_t pk_len = la + SKIP_ONE + lb + SKIP_ONE;
+                char *pk = malloc(pk_len);
                 memcpy(pk, a, la);
                 pk[la] = '\x01';
                 memcpy(pk + la + SKIP_ONE, b, lb + SKIP_ONE);
@@ -386,11 +300,22 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
                 int *val = cbm_ht_get(pair_counts, pk);
                 if (val) {
                     (*val)++;
+                    long long *ts = cbm_ht_get(pair_timestamps, pk);
+                    if (ts && commits[c].timestamp > *ts) {
+                        *ts = commits[c].timestamp;
+                    }
                     free(pk);
                 } else {
                     int *nv = malloc(sizeof(int));
                     *nv = SKIP_ONE;
+                    /* pair_counts takes ownership of pk; pair_timestamps
+                     * needs its own copy. */
+                    char *pk2 = malloc(pk_len);
+                    memcpy(pk2, pk, pk_len);
                     cbm_ht_set(pair_counts, pk, nv);
+                    long long *nts = malloc(sizeof(long long));
+                    *nts = commits[c].timestamp;
+                    cbm_ht_set(pair_timestamps, pk2, nts);
                 }
             }
         }
@@ -398,6 +323,7 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
 
     collect_coupling_ctx_t cctx = {
         .file_counts = file_counts,
+        .pair_timestamps = pair_timestamps,
         .out = out,
         .out_count = 0,
         .max_out = max_out,
@@ -406,6 +332,8 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
 
     cbm_ht_foreach(pair_counts, free_counter, NULL);
     cbm_ht_free(pair_counts);
+    cbm_ht_foreach(pair_timestamps, free_counter, NULL);
+    cbm_ht_free(pair_timestamps);
     cbm_ht_foreach(file_counts, free_counter, NULL);
     cbm_ht_free(file_counts);
 
@@ -416,6 +344,7 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
 
 /* Pre-computed coupling result buffer for fused post-pass parallelism. */
 #define MAX_COUPLINGS 8192
+#define MAX_FILE_TEMPORAL 16384
 
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
@@ -423,6 +352,8 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     result->couplings = NULL;
     result->count = 0;
     result->commit_count = 0;
+    result->file_temporal = NULL;
+    result->file_temporal_count = 0;
 
     commit_t *commits = NULL;
     int commit_count = 0;
@@ -446,10 +377,60 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
     for (int c = 0; c < commit_count; c++) {
         cf[c].files = commits[c].files;
         cf[c].count = commits[c].count;
+        cf[c].timestamp = commits[c].timestamp;
     }
 
     cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
     int coupling_count = cbm_compute_change_coupling(cf, commit_count, couplings, MAX_COUPLINGS);
+
+    /* Per-file temporal aggregation: change_count + last_modified.
+     * Single hash-table pass over the same commit set used for coupling so
+     * we don't re-scan history. NULL on OOM is fine — the caller still
+     * gets the couplings. */
+    cbm_file_temporal_t *ft_arr =
+        calloc(MAX_FILE_TEMPORAL, sizeof(cbm_file_temporal_t)); /* defined reads
+        even under the analyzer's cross-iteration view of the index map */
+    if (ft_arr) {
+        int ft_count = 0;
+        CBMHashTable *file_idx = cbm_ht_create(CBM_SZ_1K);
+        for (int c = 0; c < commit_count; c++) {
+            if (cf[c].count > GH_MAX_FILES) {
+                continue;
+            }
+            for (int f = 0; f < cf[c].count; f++) {
+                const char *fp = cf[c].files[f];
+                int *idx = cbm_ht_get(file_idx, fp);
+                if (idx) {
+                    ft_arr[*idx].change_count++;
+                    if (cf[c].timestamp > ft_arr[*idx].last_modified) {
+                        ft_arr[*idx].last_modified = cf[c].timestamp;
+                    }
+                } else if (ft_count < MAX_FILE_TEMPORAL) {
+                    /* Allocate the index cell and key BEFORE claiming a slot:
+                     * the previous unchecked malloc dereferenced NULL on
+                     * allocation failure, and a failed strdup would have
+                     * leaked the cell. */
+                    int *nidx = malloc(sizeof(int));
+                    char *key = nidx ? strdup(fp) : NULL;
+                    if (!nidx || !key) {
+                        free(nidx);
+                        continue;
+                    }
+                    int new_idx = ft_count++;
+                    snprintf(ft_arr[new_idx].file_path, sizeof(ft_arr[new_idx].file_path), "%s",
+                             fp);
+                    ft_arr[new_idx].change_count = 1;
+                    ft_arr[new_idx].last_modified = cf[c].timestamp;
+                    *nidx = new_idx;
+                    cbm_ht_set(file_idx, key, nidx);
+                }
+            }
+        }
+        cbm_ht_foreach(file_idx, free_counter, NULL);
+        cbm_ht_free(file_idx);
+        result->file_temporal = ft_arr;
+        result->file_temporal_count = ft_count;
+    }
 
     free(cf);
     for (int c = 0; c < commit_count; c++) {
@@ -483,11 +464,40 @@ int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_
         }
 
         char props[CBM_SZ_128];
-        snprintf(props, sizeof(props), "{\"co_changes\":%d,\"coupling_score\":%.2f}",
-                 cc->co_change_count, cc->coupling_score);
+        snprintf(props, sizeof(props),
+                 "{\"co_changes\":%d,\"coupling_score\":%.2f,\"last_co_change\":%lld}",
+                 cc->co_change_count, cc->coupling_score, cc->last_co_change);
 
         cbm_gbuf_insert_edge(ctx->gbuf, node_a->id, node_b->id, "FILE_CHANGES_WITH", props);
         edge_count++;
+    }
+
+    /* Apply per-file temporal metadata to existing File nodes so callers
+     * can query change_count / last_modified for hotspot analysis. The
+     * extension is re-derived and JSON-escaped to keep the props blob
+     * well-formed even for paths with quotes or backslashes. */
+    for (int i = 0; i < result->file_temporal_count; i++) {
+        const cbm_file_temporal_t *ft = &result->file_temporal[i];
+        char *qn = cbm_pipeline_fqn_compute(ctx->project_name, ft->file_path, "__file__");
+        const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+        free(qn);
+        if (!node) {
+            continue;
+        }
+
+        const char *base = strrchr(ft->file_path, '/');
+        base = base ? base + SKIP_ONE : ft->file_path;
+        const char *ext = strrchr(base, '.');
+        char ext_escaped[CBM_SZ_64];
+        cbm_json_escape(ext_escaped, (int)sizeof(ext_escaped), ext ? ext : "");
+
+        char props[CBM_SZ_256];
+        snprintf(props, sizeof(props),
+                 "{\"extension\":\"%s\",\"last_modified\":%lld,\"change_count\":%d}", ext_escaped,
+                 ft->last_modified, ft->change_count);
+
+        cbm_gbuf_upsert_node(ctx->gbuf, node->label, node->name, node->qualified_name,
+                             node->file_path, node->start_line, node->end_line, props);
     }
 
     return edge_count;
@@ -502,11 +512,12 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_githistory_compute(ctx->repo_path, &result);
 
     int edge_count = 0;
-    if (result.count > 0) {
+    if (result.count > 0 || result.file_temporal_count > 0) {
         edge_count = cbm_pipeline_githistory_apply(ctx, &result);
     }
 
     free(result.couplings);
+    free(result.file_temporal);
 
     cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_log(result.commit_count),
                  "edges", itoa_log(edge_count));

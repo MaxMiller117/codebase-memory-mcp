@@ -24,6 +24,8 @@
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
 
 /* ── Helper: create architecture test store ──────────────────────── */
 
@@ -141,7 +143,7 @@ static cbm_store_t *setup_arch_test_store(void) {
 TEST(arch_get_all) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, 0, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, NULL, 0, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.package_count > 0);
@@ -160,7 +162,7 @@ TEST(arch_entry_points_exclude_tests) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"entry_points"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     for (int i = 0; i < info.entry_point_count; i++) {
         ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
@@ -177,7 +179,7 @@ TEST(arch_hotspots_exclude_tests) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     for (int i = 0; i < info.hotspot_count; i++) {
         ASSERT_TRUE(strstr(info.hotspots[i].name, "Test") == NULL);
@@ -192,7 +194,7 @@ TEST(arch_specific_aspects) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     const char *aspects[] = {"languages", "hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 2, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 2, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.hotspot_count > 0);
@@ -206,6 +208,94 @@ TEST(arch_specific_aspects) {
     PASS();
 }
 
+TEST(arch_path_scoping) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "pscope", "/tmp/pscope"), CBM_STORE_OK);
+
+    cbm_node_t f1 = {.project = "pscope",
+                     .label = "File",
+                     .name = "a.go",
+                     .qualified_name = "pscope.apps.foo.a.go",
+                     .file_path = "apps/foo/a.go"};
+    cbm_node_t f2 = {.project = "pscope",
+                     .label = "File",
+                     .name = "b.go",
+                     .qualified_name = "pscope.other.b.go",
+                     .file_path = "other/b.go"};
+    cbm_store_upsert_node(s, &f1);
+    cbm_store_upsert_node(s, &f2);
+
+    cbm_node_t fn_foo = {.project = "pscope",
+                         .label = "Function",
+                         .name = "Foo",
+                         .qualified_name = "pscope.apps.foo.Foo",
+                         .file_path = "apps/foo/a.go"};
+    cbm_node_t fn_other = {.project = "pscope",
+                           .label = "Function",
+                           .name = "Bar",
+                           .qualified_name = "pscope.other.Bar",
+                           .file_path = "other/b.go"};
+    cbm_store_upsert_node(s, &fn_foo);
+    cbm_store_upsert_node(s, &fn_other);
+
+    const char *aspects[] = {"languages", "packages"};
+    cbm_architecture_info_t whole;
+    memset(&whole, 0, sizeof(whole));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", NULL, aspects, 2, &whole), CBM_STORE_OK);
+
+    cbm_architecture_info_t scoped;
+    memset(&scoped, 0, sizeof(scoped));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo", aspects, 2, &scoped),
+              CBM_STORE_OK);
+
+    int whole_go = 0;
+    int scoped_go = 0;
+    for (int i = 0; i < whole.language_count; i++) {
+        if (strcmp(whole.languages[i].language, "Go") == 0) {
+            whole_go = whole.languages[i].file_count;
+        }
+    }
+    for (int i = 0; i < scoped.language_count; i++) {
+        if (strcmp(scoped.languages[i].language, "Go") == 0) {
+            scoped_go = scoped.languages[i].file_count;
+        }
+    }
+    ASSERT_TRUE(whole_go > scoped_go);
+    ASSERT_EQ(scoped_go, 1);
+
+    int whole_pkg_nodes = 0;
+    for (int i = 0; i < whole.package_count; i++) {
+        whole_pkg_nodes += whole.packages[i].node_count;
+    }
+    int scoped_pkg_nodes = 0;
+    for (int i = 0; i < scoped.package_count; i++) {
+        scoped_pkg_nodes += scoped.packages[i].node_count;
+    }
+    ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
+    ASSERT_EQ(scoped_pkg_nodes, 1);
+
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+
+    cbm_architecture_info_t scoped_slash;
+    memset(&scoped_slash, 0, sizeof(scoped_slash));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo/", aspects, 2, &scoped_slash),
+              CBM_STORE_OK);
+    int slash_go = 0;
+    for (int i = 0; i < scoped_slash.language_count; i++) {
+        if (strcmp(scoped_slash.languages[i].language, "Go") == 0) {
+            slash_go = scoped_slash.languages[i].file_count;
+        }
+    }
+    ASSERT_EQ(slash_go, scoped_go);
+
+    cbm_store_architecture_free(&scoped_slash);
+    cbm_store_architecture_free(&whole);
+    cbm_store_architecture_free(&scoped);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_empty_project) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -213,7 +303,7 @@ TEST(arch_empty_project) {
 
     cbm_architecture_info_t info;
     const char *aspects[] = {"all"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "empty", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "empty", NULL, aspects, 1, &info), CBM_STORE_OK);
     /* All should be empty but no errors */
 
     cbm_store_architecture_free(&info);
@@ -226,7 +316,7 @@ TEST(arch_languages) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"languages"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     /* Check Go=3, Python=1, JavaScript=1 */
     int go_count = 0, py_count = 0, js_count = 0;
@@ -252,7 +342,7 @@ TEST(arch_routes) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"routes"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_EQ(info.route_count, 1);
     ASSERT_STR_EQ(info.routes[0].method, "POST");
@@ -269,7 +359,7 @@ TEST(arch_hotspots) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.hotspot_count > 0);
     /* ProcessOrder should be a hotspot (called by HandleRequest) */
@@ -293,7 +383,7 @@ TEST(arch_boundaries) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.boundary_count > 0);
     /* server → handler and handler → service should be present */
@@ -314,12 +404,100 @@ TEST(arch_boundaries) {
     PASS();
 }
 
+/* Build a synthetic graph (nodes Functions across packages, random CALLS
+ * edges) and return the wall ms of the "boundaries" aspect. Returns -1 on
+ * setup/query failure. */
+static double timed_boundaries_ms(int n_nodes, int n_edges, int n_pkgs) {
+    cbm_store_t *s = cbm_store_open_memory();
+    if (!s) {
+        return -1;
+    }
+    cbm_store_upsert_project(s, "perf", "/tmp/perf");
+
+    cbm_store_begin(s);
+    int64_t *ids = malloc((size_t)n_nodes * sizeof(int64_t));
+    if (!ids) {
+        cbm_store_close(s);
+        return -1;
+    }
+    for (int i = 0; i < n_nodes; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "perf.pkg%d.fn%d", i % n_pkgs, i);
+        cbm_node_t n = {.project = "perf",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "f.c"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    uint64_t rng = 42;
+    for (int i = 0; i < n_edges; i++) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        int a = (int)((rng >> 33) % (uint64_t)n_nodes);
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        int b = (int)((rng >> 33) % (uint64_t)n_nodes);
+        cbm_edge_t e = {
+            .project = "perf", .source_id = ids[a], .target_id = ids[b], .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+    cbm_store_commit(s);
+    free(ids);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"boundaries"};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = cbm_store_get_architecture(s, "perf", NULL, aspects, 1, &info);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms =
+        (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    int bcount = info.boundary_count;
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    if (rc != CBM_STORE_OK || bcount <= 0) {
+        return -1;
+    }
+    return ms;
+}
+
+/* arch_boundaries used a LINEAR SCAN over all def nodes for EVERY CALLS edge
+ * (lookup_pkg over parallel arrays) — O(E×N). On the Linux kernel graph
+ * (~1.4M defs × ~1.4M CALLS) get_architecture spun >10 min at 100% CPU. The
+ * bug was latent while C call extraction was broken (few CALLS edges) and
+ * surfaced when extraction was fixed.
+ *
+ * Guard is SELF-RELATIVE because absolute wall bounds do not survive CI's
+ * machine spread (207 ms locally vs ~26 s on the shared ubuntu-arm UBSan
+ * runner for the same work): doubling nodes AND edges must scale the aspect
+ * by ~2x (linear; allow 3x for noise), while the quadratic scales by ~4x.
+ * A fast absolute result short-circuits (pre-fix the small size alone took
+ * >4 s on an M3 Pro, so 2 s means the scan is certainly gone). */
+TEST(arch_boundaries_no_quadratic_scan) {
+    enum { BN_NODES = 40000, BN_EDGES = 80000, BN_PKGS = 200, BN_FAST_MS = 2000 };
+    double t_small = timed_boundaries_ms(BN_NODES, BN_EDGES, BN_PKGS);
+    ASSERT_TRUE(t_small >= 0);
+    if (t_small < (double)BN_FAST_MS) {
+        printf("    boundaries %dk/%dk: %.0f ms — fast path, linear\n", BN_NODES / 1000,
+               BN_EDGES / 1000, t_small);
+        PASS();
+    }
+    double t_big = timed_boundaries_ms(BN_NODES * 2, BN_EDGES * 2, BN_PKGS);
+    ASSERT_TRUE(t_big >= 0);
+    double ratio = t_big / t_small;
+    printf("    boundaries %.0f ms -> %.0f ms at 2x size (ratio %.2f, quadratic ~4)\n", t_small,
+           t_big, ratio);
+    ASSERT_TRUE(ratio < 3.0);
+    PASS();
+}
+
 TEST(arch_layers) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"layers"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.layer_count > 0);
     /* Handler package has routes, should be "api" */
@@ -339,7 +517,7 @@ TEST(arch_file_tree) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"file_tree"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.file_tree_count > 0);
     /* Check that entries have valid types */
@@ -358,7 +536,7 @@ TEST(arch_clusters) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     /* With 5 functions and 4 edges, Louvain should find at least 1 cluster */
     if (info.cluster_count == 0) {
@@ -563,6 +741,52 @@ TEST(adr_render_empty) {
     PASS();
 }
 
+/* Helper: allocate a NUL-terminated buffer of `len` 'x' characters. */
+static char *adr_test_fill(int len) {
+    char *s = malloc((size_t)len + 1);
+    if (s) {
+        memset(s, 'x', (size_t)len);
+        s[len] = '\0';
+    }
+    return s;
+}
+
+/* Regression: sections whose combined size exceeds the fixed render buffer used
+ * to overflow it. adr_render_section advanced pos by snprintf's return value
+ * (the length it WOULD have written); once pos passed buf_sz the next section
+ * computed a wrapped (huge) remaining size from (buf_sz - pos) and wrote past
+ * the stack buffer (ASan: stack-buffer-overflow WRITE).
+ *
+ * The render buffer is ST_MAX_DEGREE*ST_GROWTH = 16384. Sizes below drive the
+ * cursor to exactly buf_sz+8 after section "B" (a truncating write that stays
+ * in bounds), so section "C" performs the first out-of-bounds write right at
+ * the buffer's tail — into ASan's redzone, where it is reliably caught.
+ * Non-canonical keys render in alphabetical order (A, B, C). */
+TEST(adr_render_oversized_sections_no_overflow) {
+    enum { ADR_RENDER_BUFSZ = 16384 };
+    cbm_adr_sections_t sec = {.count = 3};
+    /* A is first: header "## A\n" (5) + value -> pos = 16000. */
+    sec.keys[0] = strdup("A");
+    sec.values[0] = adr_test_fill(15995);
+    /* B: header "\n\n## B\n" (7) + value -> intended pos = 16000+7+385 = 16392
+     * (= buf_sz + 8); the write itself truncates safely in bounds. */
+    sec.keys[1] = strdup("B");
+    sec.values[1] = adr_test_fill(385);
+    /* C: rendered with pos = 16392 > buf_sz -> "\n\n" written at buf+16392. */
+    sec.keys[2] = strdup("C");
+    sec.values[2] = strdup("z");
+    for (int i = 0; i < 3; i++) {
+        ASSERT_NOT_NULL(sec.values[i]);
+    }
+    char *rendered = cbm_adr_render(&sec);
+    /* Must not crash; result must be NUL-terminated within the render buffer. */
+    ASSERT_NOT_NULL(rendered);
+    ASSERT_TRUE(strlen(rendered) < ADR_RENDER_BUFSZ);
+    free(rendered);
+    cbm_adr_sections_free(&sec);
+    PASS();
+}
+
 TEST(adr_parse_render_roundtrip) {
     const char *original =
         "## PURPOSE\nTest project\n\n## STACK\n- Go: speed\n- SQLite: embedded\n\n"
@@ -684,12 +908,278 @@ TEST(adr_validate_keys_valid) {
     PASS();
 }
 
-TEST(adr_validate_keys_invalid) {
-    const char *keys[] = {"PURPOSE", "STACKS", "CUSTOM"};
+/* Section names are no longer restricted to the canonical six — those are a
+ * convention now, so "STACKS" and "CUSTOM" are ordinary sections. What is
+ * still refused is a name that could not round-trip through a "## NAME" line:
+ * such a name scans back as a different heading or as none, so a second
+ * identical write would append a duplicate instead of being a no-op. */
+TEST(adr_validate_keys_accepts_arbitrary_names) {
+    const char *keys[] = {"PURPOSE", "STACKS", "CUSTOM", "Decisions (2026)"};
     char errbuf[256];
-    ASSERT_TRUE(cbm_adr_validate_section_keys(keys, 3, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
-    ASSERT_TRUE(strstr(errbuf, "STACKS") != NULL);
-    ASSERT_TRUE(strstr(errbuf, "CUSTOM") != NULL);
+    ASSERT_EQ(cbm_adr_validate_section_keys(keys, 4, errbuf, sizeof(errbuf)), CBM_STORE_OK);
+    PASS();
+}
+
+TEST(adr_validate_keys_rejects_unroundtrippable) {
+    char errbuf[256];
+    const char *empty[] = {""};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(empty, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    const char *hashed[] = {"# PURPOSE"};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(hashed, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    const char *newline[] = {"PUR\nPOSE"};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(newline, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    const char *padded[] = {" PURPOSE "};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(padded, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    char toolong[128];
+    memset(toolong, 'X', sizeof(toolong) - 1);
+    toolong[sizeof(toolong) - 1] = '\0';
+    const char *big[] = {toolong};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(big, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+    PASS();
+}
+
+/* ── Splice: bytes outside the target span never change ─────────── */
+
+typedef struct {
+    char buf[512];
+    int n;
+} adr_name_collect_t;
+
+static void adr_collect_names(void *ctx, const cbm_adr_heading_t *h) {
+    adr_name_collect_t *c = (adr_name_collect_t *)ctx;
+    c->n += snprintf(c->buf + c->n, sizeof(c->buf) - (size_t)c->n, "[%.*s]", h->name_len, h->name);
+}
+
+static int adr_check_splice(const char *in, const char *name, const char *body,
+                            const char *expect) {
+    char *out = cbm_adr_splice_section(in, name, body);
+    ASSERT_NOT_NULL(out);
+    if (strcmp(out, expect) != 0) {
+        printf("  %sFAIL%s %s: splice(\"%s\")\n    in     >>>%s<<<\n    got    >>>%s<<<\n"
+               "    expect >>>%s<<<\n",
+               tf_red(), tf_reset(), __FILE__, name, in, out, expect);
+        free(out);
+        return 1;
+    }
+    free(out);
+    return 0;
+}
+
+#define CHECK_SPLICE(in, name, body, expect)                                                       \
+    do {                                                                                           \
+        if (adr_check_splice((in), (name), (body), (expect)) != 0) {                               \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (0)
+
+/* THE acceptance property. Every document below is a case where rebuilding
+ * from cbm_adr_parse_sections() would have rewritten or destroyed text: a
+ * preamble (dropped), a mis-cased heading (dropped with its whole block), an
+ * unrecognised heading in prose (absorbed), a fenced '##' (absorbed), and
+ * out-of-canonical-order sections (reordered). Splicing touches only the
+ * target span, so each survives byte-for-byte. */
+TEST(adr_splice_preserves_untouched_bytes) {
+    /* Preamble before the first heading. */
+    CHECK_SPLICE("Some preamble.\n\n## PURPOSE\nFoo", "PURPOSE", "New foo",
+                 "Some preamble.\n\n## PURPOSE\nNew foo");
+
+    /* Mis-cased heading: a real section now, and untouched when not targeted. */
+    CHECK_SPLICE("## Purpose\nFoo\n\n## STACK\nBar", "STACK", "New bar",
+                 "## Purpose\nFoo\n\n## STACK\nNew bar");
+
+    /* A heading in prose that the old parser absorbed into the section above. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n## CUSTOM\nStill here\n\n## STACK\nBar", "STACK", "New bar",
+                 "## PURPOSE\nFoo\n## CUSTOM\nStill here\n\n## STACK\nNew bar");
+
+    /* Fenced code containing a '##' line. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n\n```md\n## Example\n```\n\n## STACK\nBar", "STACK", "New bar",
+                 "## PURPOSE\nFoo\n\n```md\n## Example\n```\n\n## STACK\nNew bar");
+
+    /* Sections stored out of canonical order keep the author's order. */
+    CHECK_SPLICE("## STACK\nBar\n\n## PURPOSE\nFoo", "PURPOSE", "New foo",
+                 "## STACK\nBar\n\n## PURPOSE\nNew foo");
+
+    /* The separator run before the next heading is preserved exactly. */
+    CHECK_SPLICE("## A\nx\n\n\n## B\ny", "A", "z", "## A\nz\n\n\n## B\ny");
+
+    /* A trailing newline on the document is preserved. */
+    CHECK_SPLICE("## A\nx\n", "A", "z", "## A\nz\n");
+    PASS();
+}
+
+/* Line endings. Every other ADR fixture in this file uses \n, so nothing
+ * exercised a CRLF-stored document — and CI could not have caught that,
+ * because the fixtures are LF whichever platform runs them.
+ *
+ * The exposure is specific to splicing: the old rebuild normalised everything
+ * on the way out, so ending confusion was invisible. A byte-span replacement
+ * can cut mid-"\r\n" or miscount a separator run, and byte-identity is the
+ * property this design exists to provide.
+ *
+ * Contract: bytes that already exist are never rewritten, so each line keeps
+ * whatever ending it had. Text this code writes itself — the separator before
+ * an appended section and the "## NAME" line — follows the document's majority
+ * ending, LF on a tie. A caller's body is inserted verbatim; rewriting the
+ * bytes a caller supplied would be the same silent modification this whole
+ * change removes. */
+TEST(adr_splice_preserves_line_endings) {
+    /* CRLF throughout: untouched bytes keep their \r\n. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar", "STACK", "New bar",
+                 "## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nNew bar");
+
+    /* The separator run before the next heading survives as CRLF, not as the
+     * two bare newlines a naive walk-back would leave. */
+    CHECK_SPLICE("## A\r\nx\r\n\r\n## B\r\ny", "A", "z", "## A\r\nz\r\n\r\n## B\r\ny");
+
+    /* A trailing CRLF on the document is preserved as CRLF. */
+    CHECK_SPLICE("## A\r\nx\r\n", "A", "z", "## A\r\nz\r\n");
+
+    /* Appending to a CRLF document writes CRLF — a bare \n here would leave a
+     * mixed document that neither the author nor the tool asked for. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* One existing trailing break means one more is added, counting \r\n as a
+     * single break rather than as two characters. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* A document already ending in a CRLF blank line gains no extra break. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* LF documents are unaffected by any of the above. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n", "DECISIONS", "- New.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- New.");
+    PASS();
+}
+
+/* Mixed endings are what real files become through editors and merges. Lines
+ * that already exist keep their own endings; the majority decides only what
+ * this code writes itself. */
+TEST(adr_splice_mixed_line_endings) {
+    /* Majority CRLF (2 of 3) -> the appended block is CRLF, and the one bare
+     * LF line in the middle is left exactly as it was. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\nBar\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\nBar\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* Majority LF (2 of 3) -> the appended block is LF, and the lone CRLF line
+     * survives untouched. */
+    CHECK_SPLICE("## PURPOSE\nFoo\r\nBar\n", "DECISIONS", "- New.",
+                 "## PURPOSE\nFoo\r\nBar\n\n## DECISIONS\n- New.");
+
+    /* A tie falls to LF. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\n\n## DECISIONS\n- New.");
+
+    /* Replacing a section in a mixed document rewrites nothing around it. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\n\n## STACK\nBar\r\n", "STACK", "New",
+                 "## PURPOSE\r\nFoo\n\n## STACK\nNew\r\n");
+    PASS();
+}
+
+/* "## PURPOSE\r\n" must locate exactly as "## PURPOSE\n" does. The scanner
+ * trims \r from heading names, but trimming and matching are different claims
+ * and only one of them was pinned. */
+TEST(adr_splice_matches_headings_across_line_endings) {
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar",
+                                    adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+
+    /* A fenced block with CRLF still hides its heading, and still closes. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n```md\r\n## Example\r\n```"
+                                    "\r\n\r\n## STACK\r\nBar",
+                                    adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+
+    /* And an unterminated CRLF fence is still refused. */
+    char errbuf[256];
+    ASSERT_TRUE(cbm_adr_check_structure("## PURPOSE\r\nFoo\r\n\r\n```\r\nopen\r\n", errbuf,
+                                        sizeof(errbuf)) != CBM_STORE_OK);
+    PASS();
+}
+
+/* The original use case: add an entry under its own heading. */
+TEST(adr_splice_appends_arbitrary_heading) {
+    CHECK_SPLICE("## PURPOSE\nFoo", "DECISIONS", "- Chose SQLite.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    /* A document already ending in a blank line does not gain another. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n\n", "DECISIONS", "- Chose SQLite.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    /* An empty document becomes a plain create with no leading separator. */
+    CHECK_SPLICE("", "PURPOSE", "Only entry.", "## PURPOSE\nOnly entry.");
+    PASS();
+}
+
+/* Splicing twice must be byte-identical to splicing once — including for a
+ * non-canonical heading, the case that would have corrupted an ADR under the
+ * old rules. Trailing newlines on the body are normalised so the separator run
+ * cannot grow by a blank line on every repeat. */
+TEST(adr_splice_is_idempotent) {
+    const char *doc = "## PURPOSE\nFoo\n\n## STACK\nBar";
+    char *once = cbm_adr_splice_section(doc, "DECISIONS", "- Chose SQLite.\n");
+    ASSERT_NOT_NULL(once);
+    char *twice = cbm_adr_splice_section(once, "DECISIONS", "- Chose SQLite.\n");
+    ASSERT_NOT_NULL(twice);
+    ASSERT_STR_EQ(twice, once);
+    char *thrice = cbm_adr_splice_section(twice, "DECISIONS", "- Chose SQLite.\n");
+    ASSERT_NOT_NULL(thrice);
+    ASSERT_STR_EQ(thrice, once);
+    free(once);
+    free(twice);
+    free(thrice);
+    PASS();
+}
+
+/* Names match exactly, including case: folding them would silently merge two
+ * blocks the author chose to keep apart. */
+TEST(adr_splice_matches_case_exactly) {
+    CHECK_SPLICE("## Purpose\nLower\n\n## PURPOSE\nUpper", "PURPOSE", "New",
+                 "## Purpose\nLower\n\n## PURPOSE\nNew");
+    CHECK_SPLICE("## Purpose\nLower\n\n## PURPOSE\nUpper", "Purpose", "New",
+                 "## Purpose\nNew\n\n## PURPOSE\nUpper");
+    PASS();
+}
+
+/* A '##' line inside a fenced code block is a code sample, not a heading —
+ * and '#' / '###' are not section headings at any position. */
+TEST(adr_splice_ignores_heading_inside_fence) {
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings(
+                  "## PURPOSE\nFoo\n\n```md\n## Example\n```\n\n### Sub\n# Title\n\n## STACK\nBar",
+                  adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+    PASS();
+}
+
+/* An unterminated fence hides every heading after it, so an update would
+ * append a duplicate rather than replace. Refuse instead of guessing. */
+TEST(adr_splice_refuses_unterminated_fence) {
+    const char *doc = "## PURPOSE\nFoo\n\n```\nunclosed sample\n\n## STACK\nBar";
+    char errbuf[256];
+    ASSERT_TRUE(cbm_adr_check_structure(doc, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+    ASSERT_TRUE(strstr(errbuf, "code fence") != NULL);
+
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_TRUE(cbm_adr_scan_headings(doc, adr_collect_names, &c) != CBM_STORE_OK);
+    ASSERT_EQ(c.n, 0);
+
+    ASSERT_NULL(cbm_adr_splice_section(doc, "STACK", "New bar"));
+
+    /* A closed fence is fine. */
+    ASSERT_EQ(cbm_adr_check_structure("## A\n```\nx\n```\n", errbuf, sizeof(errbuf)), CBM_STORE_OK);
     PASS();
 }
 
@@ -808,6 +1298,225 @@ TEST(louvain_converges) {
     ASSERT_TRUE(same_count >= 8);
 
     free(result);
+    PASS();
+}
+
+/* ── Leiden multi-level / refinement tests ──────────────────────── */
+
+/* Count distinct community labels in a result. */
+static int leiden_count_communities(const cbm_louvain_result_t *r, int n) {
+    int *seen = malloc((size_t)n * sizeof(int));
+    int nd = 0;
+    for (int i = 0; i < n; i++) {
+        bool found = false;
+        for (int j = 0; j < nd; j++) {
+            if (seen[j] == r[i].community) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            seen[nd++] = r[i].community;
+        }
+    }
+    free(seen);
+    return nd;
+}
+
+/* Verify every community induces a connected subgraph under `edges` — the
+ * property Leiden's refinement guarantees and single-level Louvain does not. */
+static bool leiden_all_communities_connected(const cbm_louvain_result_t *r, int n,
+                                             const cbm_louvain_edge_t *edges, int ne) {
+    bool *vis = calloc((size_t)n, sizeof(bool));
+    int *stack = malloc((size_t)n * sizeof(int));
+    bool ok = true;
+    for (int s = 0; s < n && ok; s++) {
+        int comm = r[s].community;
+        bool seeded = false; /* community already verified from an earlier seed? */
+        for (int t = 0; t < s; t++) {
+            if (r[t].community == comm) {
+                seeded = true;
+                break;
+            }
+        }
+        if (seeded) {
+            continue;
+        }
+        for (int i = 0; i < n; i++) {
+            vis[i] = false;
+        }
+        int sp = 0;
+        stack[sp++] = s;
+        vis[s] = true;
+        while (sp > 0) {
+            int cur = stack[--sp];
+            int64_t cid = r[cur].node_id;
+            for (int e = 0; e < ne; e++) {
+                int64_t o = 0;
+                bool inc = false;
+                if (edges[e].src == cid) {
+                    o = edges[e].dst;
+                    inc = true;
+                } else if (edges[e].dst == cid) {
+                    o = edges[e].src;
+                    inc = true;
+                }
+                if (!inc) {
+                    continue;
+                }
+                for (int j = 0; j < n; j++) {
+                    if (r[j].node_id == o) {
+                        if (!vis[j] && r[j].community == comm) {
+                            vis[j] = true;
+                            stack[sp++] = j;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < n; j++) {
+            if (r[j].community == comm && !vis[j]) {
+                ok = false; /* a member was unreachable → disconnected community */
+                break;
+            }
+        }
+    }
+    free(vis);
+    free(stack);
+    return ok;
+}
+
+TEST(leiden_multilevel_collapses_noise) {
+    /* Four 8-node cliques chained by single bridge edges. Single-level Louvain
+     * tends to leave many small clusters; multi-level Leiden collapses this to
+     * roughly four well-separated, internally-connected communities. */
+    enum { CL = 4, SZ = 8, N = CL * SZ };
+    int64_t nodes[N];
+    for (int i = 0; i < N; i++) {
+        nodes[i] = i + 1;
+    }
+    cbm_louvain_edge_t edges[CL * (SZ * (SZ - 1) / 2) + CL];
+    int ne = 0;
+    for (int c = 0; c < CL; c++) {
+        int base = c * SZ + 1;
+        for (int i = 0; i < SZ; i++) {
+            for (int j = i + 1; j < SZ; j++) {
+                edges[ne++] = (cbm_louvain_edge_t){base + i, base + j};
+            }
+        }
+    }
+    for (int c = 0; c + 1 < CL; c++) {
+        edges[ne++] = (cbm_louvain_edge_t){c * SZ + 1, (c + 1) * SZ + 1};
+    }
+
+    cbm_louvain_result_t *result = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_louvain(nodes, N, edges, ne, &result, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, N);
+
+    int nc = leiden_count_communities(result, N);
+    ASSERT_TRUE(nc >= 2);
+    ASSERT_TRUE(nc <= CL + 1); /* far below N=32: the noise collapsed */
+    ASSERT_TRUE(leiden_all_communities_connected(result, N, edges, ne));
+
+    /* Each clique should be (almost) entirely in one community. */
+    for (int c = 0; c < CL; c++) {
+        int base_idx = c * SZ;
+        int same = 0;
+        for (int i = 0; i < SZ; i++) {
+            if (result[base_idx + i].community == result[base_idx].community) {
+                same++;
+            }
+        }
+        ASSERT_TRUE(same >= SZ - 1);
+    }
+    free(result);
+    PASS();
+}
+
+TEST(leiden_resolution_controls_granularity) {
+    /* Path graph of 30 nodes. Low resolution favours one large community; high
+     * resolution fragments it into more, smaller communities. */
+    enum { N = 30 };
+    int64_t nodes[N];
+    for (int i = 0; i < N; i++) {
+        nodes[i] = i + 1;
+    }
+    cbm_louvain_edge_t edges[N - 1];
+    int ne = 0;
+    for (int i = 0; i + 1 < N; i++) {
+        edges[ne++] = (cbm_louvain_edge_t){i + 1, i + 2};
+    }
+
+    cbm_louvain_result_t *lo = NULL;
+    cbm_louvain_result_t *hi = NULL;
+    int lc = 0;
+    int hc = 0;
+    ASSERT_EQ(cbm_leiden(nodes, N, edges, ne, 0.1, &lo, &lc), CBM_STORE_OK);
+    ASSERT_EQ(cbm_leiden(nodes, N, edges, ne, 5.0, &hi, &hc), CBM_STORE_OK);
+    ASSERT_EQ(lc, N);
+    ASSERT_EQ(hc, N);
+
+    int n_lo = leiden_count_communities(lo, N);
+    int n_hi = leiden_count_communities(hi, N);
+    ASSERT_TRUE(n_hi > n_lo);
+    ASSERT_TRUE(leiden_all_communities_connected(lo, N, edges, ne));
+    ASSERT_TRUE(leiden_all_communities_connected(hi, N, edges, ne));
+    free(lo);
+    free(hi);
+    PASS();
+}
+
+/* get_architecture "clusters" aspect: Leiden communities surfaced compactly. */
+TEST(arch_clusters_basic) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Two 4-function cliques in two packages, one bridge between them. */
+    int64_t id[8];
+    for (int i = 0; i < 8; i++) {
+        char nm[32];
+        char qn[64];
+        int grp = i / 4;
+        snprintf(nm, sizeof(nm), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test.pkg%d.mod.fn%d", grp, i);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = nm,
+                           .qualified_name = qn,
+                           .file_path = "f.go"};
+        id[i] = cbm_store_upsert_node(s, &node);
+    }
+    for (int g = 0; g < 2; g++) {
+        for (int a = 0; a < 4; a++) {
+            for (int b = a + 1; b < 4; b++) {
+                cbm_edge_t e = {.project = "test",
+                                .source_id = id[(g * 4) + a],
+                                .target_id = id[(g * 4) + b],
+                                .type = "CALLS"};
+                cbm_store_insert_edge(s, &e);
+            }
+        }
+    }
+    cbm_edge_t bridge = {
+        .project = "test", .source_id = id[0], .target_id = id[4], .type = "CALLS"};
+    cbm_store_insert_edge(s, &bridge);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_TRUE(info.cluster_count >= 2); /* two dense communities */
+    for (int i = 0; i < info.cluster_count; i++) {
+        ASSERT_TRUE(info.clusters[i].members >= 2);
+        ASSERT_NOT_NULL(info.clusters[i].label);
+        ASSERT_TRUE(info.clusters[i].cohesion >= 0.0 && info.clusters[i].cohesion <= 1.0);
+        ASSERT_EQ(info.clusters[i].edge_type_count, 1);
+        ASSERT_TRUE(info.clusters[i].top_node_count > 0);
+    }
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -970,11 +1679,13 @@ SUITE(store_arch) {
     RUN_TEST(arch_entry_points_exclude_tests);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
+    RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_boundaries);
+    RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
@@ -994,6 +1705,7 @@ SUITE(store_arch) {
     RUN_TEST(adr_render_all_sections);
     RUN_TEST(adr_render_non_canonical);
     RUN_TEST(adr_render_empty);
+    RUN_TEST(adr_render_oversized_sections_no_overflow);
     RUN_TEST(adr_parse_render_roundtrip);
     RUN_TEST(adr_update_sections);
     RUN_TEST(adr_update_overflow);
@@ -1002,7 +1714,17 @@ SUITE(store_arch) {
     RUN_TEST(adr_validate_missing_sections);
     RUN_TEST(adr_validate_empty);
     RUN_TEST(adr_validate_keys_valid);
-    RUN_TEST(adr_validate_keys_invalid);
+    RUN_TEST(adr_validate_keys_accepts_arbitrary_names);
+    RUN_TEST(adr_validate_keys_rejects_unroundtrippable);
+    RUN_TEST(adr_splice_preserves_untouched_bytes);
+    RUN_TEST(adr_splice_preserves_line_endings);
+    RUN_TEST(adr_splice_mixed_line_endings);
+    RUN_TEST(adr_splice_matches_headings_across_line_endings);
+    RUN_TEST(adr_splice_appends_arbitrary_heading);
+    RUN_TEST(adr_splice_is_idempotent);
+    RUN_TEST(adr_splice_matches_case_exactly);
+    RUN_TEST(adr_splice_ignores_heading_inside_fence);
+    RUN_TEST(adr_splice_refuses_unterminated_fence);
     RUN_TEST(adr_validate_keys_empty);
 
     /* Louvain */
@@ -1010,6 +1732,9 @@ SUITE(store_arch) {
     RUN_TEST(louvain_empty);
     RUN_TEST(louvain_single_node);
     RUN_TEST(louvain_converges);
+    RUN_TEST(leiden_multilevel_collapses_noise);
+    RUN_TEST(leiden_resolution_controls_granularity);
+    RUN_TEST(arch_clusters_basic);
 
     /* Helpers */
     RUN_TEST(qn_to_package);

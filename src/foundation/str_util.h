@@ -49,9 +49,29 @@ char *cbm_str_strip_ext(CBMArena *a, const char *path);
 char **cbm_str_split(CBMArena *a, const char *s, char delim, int *out_count);
 
 /* Validate a string is safe for shell interpolation inside single quotes.
- * Rejects: ' ; | & $ ` \n \r \0 (embedded NULs via len check).
+ * Rejects: ' " ; | & $ ` < > \n \r \0 (embedded NULs via len check).
+ * The Windows search path wraps shell args in cmd.exe-level "powershell -Command
+ * \"...'%s'...\"", so " can close the cmd.exe outer quote even if PowerShell's
+ * single quotes hold; < > would then become cmd.exe redirection (file-write
+ * primitive). Blocking these unconditionally hardens both POSIX and Windows.
  * Returns true if safe, false if the string contains shell metacharacters. */
 bool cbm_validate_shell_arg(const char *s);
+
+/* Validate a filesystem path that will be interpolated into a shell command.
+ * Everything cbm_validate_shell_arg rejects, plus the cmd.exe expansion
+ * metacharacters % ! ^ on Windows: a path reaching `git -C "%s"` through
+ * cmd.exe would otherwise get %VAR% / delayed-!VAR! expansion applied to it.
+ *
+ * Use this — not cbm_validate_shell_arg — for every path that crosses into a
+ * shell command, so the three git shell-out sites cannot drift apart again.
+ * Returns true if safe. */
+bool cbm_validate_shell_path_arg(const char *path);
+
+/* Validate a project name is safe for file path construction.
+ * Allows: alphanumeric, dash, underscore, dot (but not leading dot or dot-dot).
+ * Rejects: path separators (/ \), directory traversal (..), and control chars.
+ * Returns true if safe, false if the name could escape the cache directory. */
+bool cbm_validate_project_name(const char *name);
 
 /* Safe snprintf append: clamps offset to prevent buffer overflow on truncation.
  * When snprintf truncates, it returns what it WOULD have written, which can make

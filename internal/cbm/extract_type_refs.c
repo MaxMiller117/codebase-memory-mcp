@@ -5,6 +5,7 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "extract_node_stack.h"
 
 enum { MIN_TYPE_LEN = 1 };
 
@@ -115,7 +116,7 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
         return;
     }
 
-    CBMUsage usage;
+    CBMUsage usage = {0};
     usage.ref_name = type_name;
     usage.enclosing_func_qn = func_qn;
     cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
@@ -221,6 +222,7 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
         break;
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         extract_ts_body_type_refs(ctx, node, kind, func_qn);
         break;
     case CBM_LANG_JAVA:
@@ -258,17 +260,16 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
 }
 
 // Walk function body for type references (casts, type assertions, local var types, generics).
-#define BODY_TYPE_REF_STACK_CAP 4096
 static void walk_body_type_refs(CBMExtractCtx *ctx, TSNode root, const char *func_qn) {
-    TSNode stack[BODY_TYPE_REF_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
-    while (top > 0) {
-        TSNode node = stack[--top];
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
         process_body_type_ref(ctx, node, func_qn);
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < BODY_TYPE_REF_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -299,26 +300,25 @@ static void process_func_type_refs(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
-#define TYPE_REF_STACK_CAP 4096
 static void walk_type_refs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     if (!spec->function_node_types || !spec->function_node_types[0]) {
         return;
     }
 
-    TSNode stack[TYPE_REF_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
 
-    while (top > 0) {
-        TSNode node = stack[--top];
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
 
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             process_func_type_refs(ctx, node);
             continue;
         }
         uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0 && top < TYPE_REF_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
