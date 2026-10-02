@@ -2750,6 +2750,18 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     return c->negated ? !result : result;
 }
 
+/* True when any condition under e names a variable this binding has not bound yet. */
+static bool expr_has_unbound_ref(const cbm_expr_t *e, binding_t *b) { // NOLINT(misc-no-recursion)
+    if (!e) {
+        return false;
+    }
+    if (e->type == EXPR_CONDITION) {
+        const char *var = e->cond.variable;
+        return var && !e->cond.func && !binding_get_edge(b, var) && !binding_get(b, var);
+    }
+    return expr_has_unbound_ref(e->left, b) || expr_has_unbound_ref(e->right, b);
+}
+
 /* Recursive expression tree evaluator */
 static bool eval_expr(const cbm_expr_t *e, binding_t *b) { // NOLINT(misc-no-recursion)
     if (!e) {
@@ -2763,6 +2775,11 @@ static bool eval_expr(const cbm_expr_t *e, binding_t *b) { // NOLINT(misc-no-rec
     case EXPR_OR:
         return (eval_expr(e->left, b) || eval_expr(e->right, b)) != 0;
     case EXPR_NOT:
+        /* The early WHERE pass runs before expansion binds every variable, and an unbound
+         * reference passes leniently; inverting that pass would drop every binding. */
+        if (expr_has_unbound_ref(e->left, b)) {
+            return true;
+        }
         return (!eval_expr(e->left, b)) != 0;
     case EXPR_XOR:
         return eval_expr(e->left, b) != eval_expr(e->right, b);

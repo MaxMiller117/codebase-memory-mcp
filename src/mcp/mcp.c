@@ -3762,6 +3762,7 @@ enum {
     BM25_BIND_OFFSET = 4,
     BM25_BIND_INNER = 5,
     BM25_BIND_FILE = 6,
+    BM25_BIND_LABEL = 7,
     BM25_SQL_AUTO_LEN = -1,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
@@ -4019,8 +4020,8 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
-                         const char *file_pattern, int limit, int offset, bool tree_format,
-                         size_t max_output_bytes) {
+                         const char *file_pattern, const char *label, int limit, int offset,
+                         bool tree_format, size_t max_output_bytes) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -4031,6 +4032,13 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         return NULL;
     }
     char *file_like = bm25_file_pattern_like(file_pattern);
+    if (label && !label[0]) {
+        label = NULL;
+    }
+    /* A scoped query (file_pattern/label) ranks the full match set: the global top-N window
+     * can hold zero in-scope rows on a large multi-repo index. LIMIT -1 = no limit. */
+    bool scoped = file_like != NULL || label != NULL;
+    int inner_limit = scoped ? -1 : BM25_INNER_LIMIT;
 
     /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
      *
@@ -4070,6 +4078,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
          * must be changed together or results desynchronise from counts. */
         "  AND n.label NOT IN ('File','Folder','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
+        "  AND (?7 IS NULL OR n.label = ?7) "
         /* rank ties are common (boosted floats) — the id tie-break makes
          * offset pages contractually stable across calls. */
         "ORDER BY rank, n.id "
@@ -4084,7 +4093,12 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
     sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
-    sqlite3_bind_int(stmt, BM25_BIND_INNER, BM25_INNER_LIMIT);
+    sqlite3_bind_int(stmt, BM25_BIND_INNER, inner_limit);
+    if (label) {
+        sqlite3_bind_text(stmt, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_LABEL);
+    }
     if (file_like) {
         sqlite3_bind_text(stmt, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     } else {
@@ -4107,6 +4121,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                                  * not describe the rows returned. */
                                 "      AND n.label NOT IN ('File','Folder','Variable','Project')"
                                 "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
+                                "      AND (?7 IS NULL OR n.label = ?7)"
                                 ")";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
@@ -4114,7 +4129,13 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                               MCP_SQLITE_TRANSIENT);
             sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
+            sqlite3_bind_int(cs, BM25_BIND_LIMIT, inner_limit);
+            if (label) {
+                sqlite3_bind_text(cs, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN,
+                                  MCP_SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(cs, BM25_BIND_LABEL);
+            }
             if (file_like) {
                 sqlite3_bind_text(cs, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
                                   MCP_SQLITE_TRANSIENT);
@@ -4133,8 +4154,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * a window-local count as the complete match count. This is global to the
      * FTS table; saturation is therefore conservatively reported even when
      * later project/path filters might discard the hidden candidates. */
-    bool candidate_window_saturated = true;
-    {
+    bool candidate_window_saturated = !scoped;
+    if (!scoped) {
         const char *probe_sql = "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1 "
                                 "ORDER BY bm25(nodes_fts), rowid LIMIT 1 OFFSET ?2";
         sqlite3_stmt *probe = NULL;
@@ -5089,9 +5110,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     if (query && query[0]) {
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, limit, offset,
-                                      !json_format, max_output_bytes);
+        char *q_label = cbm_mcp_get_string_arg(args, "label");
+        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_label, limit,
+                                      offset, !json_format, max_output_bytes);
         free(q_file_pattern);
+        free(q_label);
         if (bm25_json) {
             free(query);
             free(project);
