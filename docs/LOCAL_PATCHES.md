@@ -29,6 +29,10 @@ every Claude Code session.
    - A member (method, field, call) is visible under the same rule or when it is in the caller's repo. An invisible
      member edge is dropped. At file scope, a member named like a segment of the file's namespace or `using` paths
      (the token of `namespace FleetHd.Models`) is dropped.
+   - A call `X.M()` whose receiver X is one PascalCase name, and no field or property named X exists in the caller's
+     repo, is a static call: a guessed member of a type not named X (or aliased as X) is dropped
+     (`cbm_pipeline_cs_static_receiver_mismatch`). `Assert.True` no longer binds an enum member `True`, nor
+     `Math.Max` an entity method. Name-guessed `X.M()` calls went from 3,141 to 442 on the monolith.
    - The check uses a map from file to declared namespace. An incremental run extracts only changed files, so
      `cbm_pipeline_cs_ns_add_unchanged` (called from `pipeline_incremental.c`) reads the first `namespace` line of
      every other `.cs` file. `CBM_FLEETHD_NO_CS_VISIBILITY=1` turns the check off.
@@ -45,6 +49,17 @@ every Claude Code session.
    calls resolved as `cs_method_typed` went from 3,633 to 14,037.
 7. **Server instructions state the watcher dependency** (`src/mcp/mcp.c`, `MCP_SERVER_INSTRUCTIONS`). The text
    says that indexes refresh automatically only when `auto_watch` is on. FleetHd runs with the watcher off.
+8. **Read-only tool calls of one session run in parallel** (`src/daemon/frontend.c`,
+   `cbm_daemon_frontend_mcp_run_pool`; `src/main.c`, `main_open_lane`). Upstream runs the requests of one MCP server
+   one at a time, so parallel subagents of one session queue. The frontend now opens more daemon connections of the
+   same session, up to `CBM_FLEETHD_MCP_CONNECTIONS` (default 4, 1 = upstream behaviour), but only when read-only
+   tool calls are queued and every open connection is busy: the daemon accepts at most 64 connections in total.
+   - Each extra connection replays the session's `initialize` and `notifications/initialized` once. Only
+     read-only tools (`search_graph`, `query_graph`, `trace_path`, `get_code_snippet`, `search_code`, …) go to the
+     pool queue; every other message runs on the first connection in arrival order. Cancellation finds the request
+     on any connection.
+   - Measured (2026-10-24, 16 concurrent requests to one server): 6.5 s with 1 connection, 2.4 s with 4, 1.3 s with
+     8. The first burst of a session runs at 1-connection speed while the extra connections warm up.
 
 ## Tests
 
@@ -52,7 +67,8 @@ Each test below is in upstream's suite and fails when its patch is removed (chec
 
 | Test | Patches |
 |---|---|
-| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 3, 4, 5, 6 |
+| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 3, 4 (with static receivers), 5, 6 |
+| `daemon_frontend_pool_runs_read_only_calls_in_parallel` (`tests/test_daemon_frontend.c`) | 8 |
 | `incr_csharp_visibility_matches_full_run` (`tests/test_incremental.c`) | 4 (incremental runs) |
 | `tool_search_graph_bm25_scoped_query_ranks_full_match_set` (`tests/test_mcp.c`) | 2 |
 | `repro_call_argument_ts_lsp_cannot_rescue` (upstream test) | 1 (TypeScript annotations) |

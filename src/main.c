@@ -1688,6 +1688,18 @@ static bool main_session_context(const char *preferred_root, char root_out[MAIN_
     return true;
 }
 
+/* FleetHd local patch: the most daemon connections one MCP session may open
+ * (CBM_FLEETHD_MCP_CONNECTIONS, 1 to CBM_DAEMON_FRONTEND_MAX_LANES, default 4). Extra
+ * connections open only on demand; 1 is upstream's single connection. */
+static int main_fleethd_mcp_connections(void) {
+    const char *value = getenv("CBM_FLEETHD_MCP_CONNECTIONS");
+    int count = value && value[0] ? atoi(value) : 4;
+    if (count < 1) {
+        return 1;
+    }
+    return count > CBM_DAEMON_FRONTEND_MAX_LANES ? CBM_DAEMON_FRONTEND_MAX_LANES : count;
+}
+
 static bool main_set_client_context(cbm_daemon_runtime_client_t *client, const char *preferred_root,
                                     cbm_mcp_tool_profile_t tool_profile, const char *hook_event,
                                     const char *hook_dialect, uint32_t timeout_ms) {
@@ -1700,6 +1712,28 @@ static bool main_set_client_context(cbm_daemon_runtime_client_t *client, const c
     return cbm_daemon_application_client_set_context(client, root, allowed_ptr, tool_profile,
                                                      hook_event, hook_dialect, timeout_ms) ==
            CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
+/* FleetHd local patch: what the frontend needs to open one more connection of this
+ * MCP session (cbm_daemon_frontend_mcp_run_pool). */
+typedef struct {
+    const cbm_daemon_ipc_endpoint_t *endpoint;
+    const cbm_daemon_build_identity_t *identity;
+    cbm_mcp_tool_profile_t tool_profile;
+    uint32_t timeout_ms;
+} main_lane_context_t;
+
+static cbm_daemon_runtime_client_t *main_open_lane(void *opaque) {
+    const main_lane_context_t *context = opaque;
+    cbm_daemon_runtime_connect_result_t connect_result;
+    cbm_daemon_runtime_client_t *client = cbm_daemon_runtime_client_connect(
+        context->endpoint, context->identity, MAIN_CONNECT_TIMEOUT_MS, &connect_result);
+    if (client && !main_set_client_context(client, NULL, context->tool_profile, NULL, NULL,
+                                           context->timeout_ms)) {
+        (void)cbm_daemon_runtime_client_close(client, MAIN_CLOSE_TIMEOUT_MS);
+        client = NULL;
+    }
+    return client;
 }
 
 /* Parse a strict MAJOR.MINOR.PATCH triple; false for anything else (dev
@@ -3372,8 +3406,10 @@ int main(int argc, char **argv) {
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =
         main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result, true);
-    cbm_daemon_ipc_endpoint_free(endpoint);
+    /* FleetHd local patch: the frontend opens more connections of this session on demand
+     * (main_open_lane), so the endpoint lives until the frontend ends. */
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
+        cbm_daemon_ipc_endpoint_free(endpoint);
         main_report_client_bootstrap_failure(role, &bootstrap_result);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
@@ -3389,6 +3425,7 @@ int main(int argc, char **argv) {
         !main_set_client_context(g_daemon_client, NULL, tool_profile, NULL, NULL,
                                  bootstrap_config.startup_timeout_ms)) {
         (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
+        cbm_daemon_ipc_endpoint_free(endpoint);
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
@@ -3410,6 +3447,7 @@ int main(int argc, char **argv) {
                 g_daemon_client, update_mask, ui_enabled, ui_port,
                 bootstrap_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
             (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
+            cbm_daemon_ipc_endpoint_free(endpoint);
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
@@ -3426,6 +3464,7 @@ int main(int argc, char **argv) {
      * parent watchdog would linger as an orphan after the editor dies). */
     if (!client_start_parent_watchdog(process_initial_ppid)) {
         (void)fprintf(stderr, "codebase-memory-mcp: parent-death watchdog could not start\n");
+        cbm_daemon_ipc_endpoint_free(endpoint);
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
@@ -3433,8 +3472,17 @@ int main(int argc, char **argv) {
     }
 
     setup_signal_handlers();
-    int result = cbm_daemon_frontend_mcp_run(g_daemon_client, client_cohort_manager, stdin, stdout);
-    g_daemon_client = NULL; /* frontend consumed the handle */
+    main_lane_context_t lane_context = {
+        .endpoint = endpoint,
+        .identity = &identity,
+        .tool_profile = tool_profile,
+        .timeout_ms = bootstrap_config.startup_timeout_ms,
+    };
+    int result = cbm_daemon_frontend_mcp_run_pool(g_daemon_client, main_open_lane, &lane_context,
+                                                  main_fleethd_mcp_connections(),
+                                                  client_cohort_manager, stdin, stdout);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    g_daemon_client = NULL; /* frontend consumed the handles */
     bool client_cohort_cleanup =
         main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
     atomic_store(&g_shutdown, 1);

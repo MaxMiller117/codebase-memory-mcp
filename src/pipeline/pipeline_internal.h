@@ -777,6 +777,13 @@ void cbm_pipeline_set_nsmap(CBMHashTable *map);
 bool cbm_pipeline_cs_target_visible(const char *project, const CBMFileResult *caller,
                                     const char *target_file_path, const char *ref_name);
 
+/* FleetHd local patch: a C# call `X.M()` whose receiver X is one PascalCase name, not a
+ * field or property in the caller's repo, is a static call: true when the guessed member
+ * `qn` belongs to a type not named X (`Assert.True` guessed onto `SomeEnum.True`). */
+bool cbm_pipeline_cs_static_receiver_mismatch(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                              const CBMFileResult *caller, const char *caller_rel,
+                                              const char *callee_name, const char *qn);
+
 /* FleetHd local patch: for a C# call guessed onto a type (`new T()`) that the caller cannot
  * see, the QN of the one visible type of that name; else `qn` unchanged. */
 const char *cbm_pipeline_cs_call_type_qn(const cbm_registry_t *r, const cbm_gbuf_t *gb,

@@ -2924,7 +2924,11 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     static const char results[] = "namespace RepoD.Web;\npublic class Results {\n"
                                   "    public void Ok() { }\n}\n";
     static const char controller[] = "namespace RepoC;\npublic class TruckController : ControllerBase {\n"
-                                     "    public void Get() { Ok(); }\n}\n";
+                                     "    public void Get() { Ok(); }\n"
+                                     "    public void Check() { Assert.True(true); }\n"
+                                     "    public void Use() { Flags.True(); }\n}\n";
+    static const char flags[] = "namespace RepoC;\npublic static class Flags {\n"
+                                "    public static bool True() { return true; }\n}\n";
     static const char regular[] = "namespace RepoA.Api;\npublic class RegularController {\n"
                                   "    public int GetByVinAsync(string vin) { return 1; }\n}\n";
     static const char other[] = "namespace RepoD.Api;\npublic class AaaController {\n"
@@ -2936,11 +2940,11 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         "repoA/src/VehicleDto.cs",    "repoB/src/VehicleDto.cs",  "repoC/src/User.cs",
         "repoC/src/AliasUser.cs",     "repoC/src/Guarded.cs",     "repoD/src/Results.cs",
         "repoC/src/Controller.cs",    "repoA/src/RegularController.cs",
-        "aaaRepo/src/AaaController.cs", "repoC/src/ControllerTests.cs",
+        "aaaRepo/src/AaaController.cs", "repoC/src/ControllerTests.cs", "repoC/src/Flags.cs",
     };
     const char *srcs[] = {a_dto,      b_dto,   user,  alias_user, guarded,
-                          results,    controller, regular, other, tests};
-    enum { N_FILES = 10, N_CHECKS = 9 };
+                          results,    controller, regular, other, tests, flags};
+    enum { N_FILES = 11, N_CHECKS = 11 };
     const char *project = "cbm_fleethd_cs";
 
     char tmpdir[256];
@@ -2975,6 +2979,7 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     const char *regular_get = "cbm_fleethd_cs.repoA.src.RegularController.RegularController."
                               "GetByVinAsync";
     const char *other_get = "cbm_fleethd_cs.aaaRepo.src.AaaController.AaaController.GetByVinAsync";
+    const char *flags_true = "cbm_fleethd_cs.repoC.src.Flags.Flags.True";
     bool ok[2][N_CHECKS];
     bool all = true;
     for (int g = 0; g < 2; g++) {
@@ -2988,6 +2993,8 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         ok[g][6] = !has_edge_from_callable_to_qn(gb, "TruckController.Get", ok_method, "CALLS");
         ok[g][7] = has_edge_from_callable_to_qn(gb, "ControllerTests.Call", regular_get, "CALLS");
         ok[g][8] = !has_edge_from_callable_to_qn(gb, "ControllerTests.Call", other_get, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "TruckController.Check", flags_true, "CALLS");
+        ok[g][10] = has_edge_from_callable_to_qn(gb, "TruckController.Use", flags_true, "CALLS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
         }
@@ -2995,9 +3002,9 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     if (!all) {
         for (int g = 0; g < 2; g++) {
             printf("  C# FleetHd diagnostic %s: using=%d/%d ctor=%d alias=%d/%d if_using=%d "
-                   "framework_call=%d field_call=%d/%d\n",
+                   "framework_call=%d field_call=%d/%d static_receiver=%d/%d\n",
                    g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
-                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8]);
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10]);
         }
     }
     cbm_gbuf_free(graphs[0]);

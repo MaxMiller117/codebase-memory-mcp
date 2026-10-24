@@ -71,4 +71,18 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
                                 cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out);
 
+/* FleetHd local patch: as cbm_daemon_frontend_mcp_run, but read-only tool calls may run
+ * in parallel on up to `lane_limit` - 1 more connections of the same session. A
+ * connection opens (through `open_lane`) only when read-only calls are queued and every
+ * open connection is busy, because the daemon accepts at most 64 connections in total.
+ * Every other message runs on `client` in arrival order. The frontend owns and closes
+ * every client. */
+enum { CBM_DAEMON_FRONTEND_MAX_LANES = 8 };
+typedef cbm_daemon_runtime_client_t *(*cbm_daemon_frontend_open_lane_fn)(void *context);
+int cbm_daemon_frontend_mcp_run_pool(cbm_daemon_runtime_client_t *client,
+                                     cbm_daemon_frontend_open_lane_fn open_lane,
+                                     void *open_context, int lane_limit,
+                                     cbm_version_cohort_manager_t *cohort_manager, FILE *in,
+                                     FILE *out);
+
 #endif /* CBM_DAEMON_FRONTEND_H */

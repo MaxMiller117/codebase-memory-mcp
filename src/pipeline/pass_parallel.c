@@ -3447,8 +3447,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             /* FleetHd local patch: a C# name guess this file cannot see. MUST match
              * pass_calls.c, where every `res` here is already a registry guess. */
             (lang == CBM_LANG_CSHARP && !lsp_target &&
-             !cbm_pipeline_cs_qn_visible(rc->main_gbuf, rc->project_name, result, rel,
-                                         res.qualified_name, call->callee_name));
+             (!cbm_pipeline_cs_qn_visible(rc->main_gbuf, rc->project_name, result, rel,
+                                          res.qualified_name, call->callee_name) ||
+              cbm_pipeline_cs_static_receiver_mismatch(rc->registry, rc->main_gbuf, result, rel,
+                                                       call->callee_name,
+                                                       res.qualified_name)));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve

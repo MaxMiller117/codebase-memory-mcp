@@ -1185,6 +1185,70 @@ const cbm_gbuf_node_t *cbm_pipeline_cs_visible_target(const cbm_registry_t *r,
     return found;
 }
 
+bool cbm_pipeline_cs_static_receiver_mismatch(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                              const CBMFileResult *caller, const char *caller_rel,
+                                              const char *callee_name, const char *qn) {
+    const char *dot = callee_name ? strrchr(callee_name, '.') : NULL;
+    if (!dot || !qn || !qn[0]) {
+        return false;
+    }
+    char recv[CBM_SZ_256];
+    size_t n = 0;
+    for (const char *p = callee_name; p < dot; p++) {
+        if (isspace((unsigned char)*p)) {
+            continue;
+        }
+        if (!(isalnum((unsigned char)*p) || *p == '_') || n + 1 >= sizeof(recv)) {
+            return false; /* a chain, an index or an invocation: not one receiver name */
+        }
+        recv[n++] = *p;
+    }
+    recv[n] = '\0';
+    if (n == 0 || !isupper((unsigned char)recv[0])) {
+        return false;
+    }
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gb, qn);
+    if (!node || !node->label || cs_type_label(node->label)) {
+        return false; /* a type target: X is a qualifier (`new Ns.T()`, a nested type) */
+    }
+    const char *last = strrchr(qn, '.');
+    if (!last) {
+        return false;
+    }
+    const char *owner = last;
+    while (owner > qn && owner[-1] != '.') {
+        owner--;
+    }
+    size_t owner_len = (size_t)(last - owner);
+    if (owner_len == n && strncmp(owner, recv, n) == 0) {
+        return false;
+    }
+    /* `using X = Ns.Owner;` */
+    for (int i = 0; caller && i < caller->imports.count; i++) {
+        const char *local = caller->imports.items[i].local_name;
+        const char *mp = caller->imports.items[i].module_path;
+        const char *mp_last = mp ? strrchr(mp, '.') : NULL;
+        mp_last = mp_last ? mp_last + 1 : mp;
+        if (local && mp_last && strcmp(local, recv) == 0 && strlen(mp_last) == owner_len &&
+            strncmp(mp_last, owner, owner_len) == 0) {
+            return false;
+        }
+    }
+    /* X may be a field or property, whose type the C# pass could not see. */
+    const char **qns = NULL;
+    int count = 0;
+    if (cbm_registry_find_by_name(r, recv, &qns, &count) == 0) {
+        for (int i = 0; i < count; i++) {
+            const cbm_gbuf_node_t *f = cbm_gbuf_find_by_qn(gb, qns[i]);
+            if (f && f->label && strcmp(f->label, "Field") == 0 &&
+                cs_same_repo(caller_rel, f->file_path)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 const char *cbm_pipeline_cs_call_type_qn(const cbm_registry_t *r, const cbm_gbuf_t *gb,
                                          const char *project, const CBMFileResult *caller,
                                          const char *caller_rel, const char *qn,

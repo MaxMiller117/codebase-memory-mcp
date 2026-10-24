@@ -19,22 +19,15 @@ answers with no warning.
 **Fix not taken:** a fallback to the only indexed project. Upstream tests (`tool_sg_invalid_project`,
 `tool_qg_invalid_project`, the session-start hook tests) and the hooks require the not-found error.
 
-## 2. Concurrent requests on one MCP server run one at a time
+## 2. The first parallel burst of a session is not faster
 
-All subagents of one Claude Code session share that session's MCP server. Each server is one connection to the
-account daemon, and the daemon runs the requests of one connection one at a time (`src/daemon/runtime.c`).
+Local patch 8 opens extra daemon connections only when read-only calls queue. Each new connection replays the
+handshake and opens its own session store, so the burst that opens it runs at about 1-connection speed. Later
+bursts run in parallel: 4 concurrent `query_graph` calls took 2.5 s in the first burst and 0.7 s in the second
+(4 connections, 2026-10-24).
 
-**Status:** open. Measured on `0.12.1-fleethd.1` (2026-10-24, 4 mixed queries):
-
-| Case | Wall time | Median latency | Max latency |
-|---|---:|---:|---:|
-| 16 requests one after another, one server (sum of single latencies) | 6.1 s | 0.26 s | 0.94 s |
-| 16 concurrent requests, one server | 6.7 s | 3.8 s | 6.7 s |
-| 16 servers, one request each, concurrent | 1.1 s | 0.46 s | 1.1 s |
-
-**Possible fix (upstream):** let one daemon connection run read-only requests in parallel. This changes the
-daemon protocol (requests in flight, response order, cancellation), so it is a request for upstream, not a fork
-patch. Separate sessions already run in parallel.
+**Not changed on purpose:** connections that open at session start would hold daemon connections (64 in total)
+for sessions that never call tools in parallel.
 
 ## 3. One build version per account daemon
 
@@ -51,11 +44,21 @@ or the start fails with `secure CLI coordination could not be created (endpoint)
 
 Local patch 6 types calls through fields, parameters and locals. A receiver whose type the pass cannot infer (for
 example a `var` from a method whose return type is not registered) still falls back to a name guess. Local patch 4
-removes such a guess only when it goes to another repo, so a guess inside the caller's repo stays, and it can name
-the wrong class. On the monolith, 20,675 C# `CALLS` edges are `suffix_match` guesses, and 2 of the 9
-`_sut.GetByVinAsync` calls in `TruckContextQueryControllerTests` still go to `SensorQueryController`.
+removes such a guess when it goes to another repo, or when a static receiver (`Assert.True`) does not match the
+target's type, so a guess inside the caller's repo can stay and name the wrong class. On the monolith
+(2026-10-24), 26,847 C# `CALLS` edges are name guesses:
 
-**Possible fix:** trace the receiver's type further (method return types, `await` of `Task<T>`).
+| Receiver shape | Edges | Note |
+|---|---:|---|
+| bare `M()` | 19,844 | 11,808 go to a class (constructor calls, mostly correct) |
+| local or parameter `x.M()` | 2,846 | LINQ and collection methods (`Select`, `Add`) bind a project method |
+| chain `a.B().C()` | 1,334 | |
+| member chain `a.b.C()` | 1,318 | |
+| field `_f.M()` | 1,050 | framework types (`ILogger.LogError`) bind a project method |
+| static `X.M()` | 442 | X is a property in the repo |
+
+**Possible fix:** when the C# pass typed the receiver to a type outside the project (an `ILogger`, a `List<T>`),
+do not fall back to a name guess.
 
 ## 5. Some qualified type references still lose their edge
 
@@ -63,6 +66,10 @@ Local patch 4 reads a reference's qualifier from the source, but 9 of the 21,928
 a type that the file does reach. These are rare forms that the qualifier reader does not parse.
 
 ## Fixed in `0.12.1-fleethd.1`
+
+- **Concurrent requests on one MCP server ran one at a time.** 16 concurrent requests to one server took 6.7 s
+  (median latency 3.8 s), against 1.1 s on 16 separate servers. With local patch 8 and 4 connections they take
+  2.4 s (median 1.2 s); with 8, 1.3 s.
 
 - **`WITH … WHERE` ignored the `WHERE`.** The `TroubleCodeDto` count with `WITH a WHERE NOT …` returned 170, the
   unfiltered count. It now returns 31, the same as the filter in `MATCH … WHERE` (upstream `951b2fdd`).
