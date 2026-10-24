@@ -223,6 +223,39 @@ static inline bool cbm_pipeline_node_is_callable_target(const cbm_gbuf_node_t *n
            strcmp(node->label, "Constructor") == 0 || strcmp(node->label, "Class") == 0;
 }
 
+/* FleetHd local patch: a C# USAGE names a type, not its same-named constructor
+ * (`Ns.Foo.Foo` -> `Ns.Foo`), which the callable-first registry tie-break picks. */
+static inline const cbm_gbuf_node_t *cbm_pipeline_cs_ctor_owner(const cbm_gbuf_t *gb,
+                                                               const cbm_gbuf_node_t *node) {
+    if (!node || !node->label || !node->name || !node->qualified_name ||
+        strcmp(node->label, "Method") != 0) {
+        return node;
+    }
+    const char *qn = node->qualified_name;
+    size_t qlen = strlen(qn);
+    size_t nlen = strlen(node->name);
+    if (nlen == 0 || qlen < 2 * nlen + 2) {
+        return node;
+    }
+    const char *last = qn + qlen - nlen;
+    const char *prev = last - 1 - nlen;
+    if (last[-1] != '.' || strcmp(last, node->name) != 0 ||
+        strncmp(prev, node->name, nlen) != 0 || (prev > qn && prev[-1] != '.')) {
+        return node;
+    }
+    char parent[CBM_SZ_1K];
+    size_t plen = qlen - nlen - 1;
+    if (plen >= sizeof(parent)) {
+        return node;
+    }
+    memcpy(parent, qn, plen);
+    parent[plen] = '\0';
+    const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_qn(gb, parent);
+    bool is_type = owner && owner->label &&
+                   (strcmp(owner->label, "Class") == 0 || strcmp(owner->label, "Struct") == 0);
+    return is_type ? owner : node;
+}
+
 /* The Kotlin resolver claims a property READ on a typed receiver with an exact
  * row (lsp_kt_property_ref) so that the raw-name fallback cannot borrow a
  * same-named function. That row names a property, never a function value. Its

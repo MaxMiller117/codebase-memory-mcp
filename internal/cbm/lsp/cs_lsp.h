@@ -113,6 +113,10 @@ typedef struct {
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
+
+    /* FleetHd local patch: this file's typed fields and properties (a cs_fields_table_t),
+     * collected by the cross-file pass, whose registered types carry no fields. */
+    const void *file_fields;
 } CSLSPContext;
 
 /* Initialize a CSLSPContext for processing one file. */

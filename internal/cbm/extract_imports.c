@@ -2647,9 +2647,18 @@ static void parse_php_imports(CBMExtractCtx *ctx) {
 // generic path-field extractor wrongly returns the alias `F`, so we instead
 // take the LAST qualified_name/identifier (the real namespace/type), and use
 // the `name` field as local_name when present.
-static void parse_csharp_imports(CBMExtractCtx *ctx) {
+// FleetHd local patch: a `using` can sit inside `#if`/`#else` or a namespace block, so
+// those containers are searched too.
+static bool csharp_using_container(const char *kind) {
+    return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_elif") == 0 ||
+           strcmp(kind, "preproc_else") == 0 || strcmp(kind, "namespace_declaration") == 0 ||
+           strcmp(kind, "file_scoped_namespace_declaration") == 0 ||
+           strcmp(kind, "declaration_list") == 0;
+}
+
+static void parse_csharp_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
     CBMArena *a = ctx->arena;
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
         return;
@@ -2657,6 +2666,9 @@ static void parse_csharp_imports(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), "using_directive") != 0) {
+            if (depth < 8 && csharp_using_container(ts_node_type(node))) {
+                parse_csharp_imports_in(ctx, node, depth + 1);
+            }
             continue;
         }
         // Find the right-most qualified_name / identifier (the namespace/type),
@@ -2682,14 +2694,25 @@ static void parse_csharp_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        // Alias name, if any.
+        // Alias name, if any. FleetHd local patch: tree-sitter-c-sharp puts the alias of
+        // `using A = N;` in the `name` field.
         TSNode alias = ts_node_child_by_field_name(node, TS_FIELD("alias"));
+        if (ts_node_is_null(alias)) {
+            TSNode named = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (!ts_node_is_null(named) && !ts_node_eq(named, path_node)) {
+                alias = named;
+            }
+        }
         const char *local =
             !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
         CBMImport imp = {.local_name = local, .module_path = path};
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+static void parse_csharp_imports(CBMExtractCtx *ctx) {
+    parse_csharp_imports_in(ctx, ctx->root, 0);
 }
 
 // --- Generic spec-driven imports ---
@@ -2996,6 +3019,15 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
+        // FleetHd local patch: a C# file wrapped in `#if` declares its namespace inside it.
+        if (ctx->language == CBM_LANG_CSHARP && strncmp(kind, "preproc_", 8) == 0) {
+            TSNode inner = node;
+            if (find_first_descendant_of(node, "namespace_declaration", &inner) ||
+                find_first_descendant_of(node, "file_scoped_namespace_declaration", &inner)) {
+                node = inner;
+                kind = ts_node_type(node);
+            }
+        }
         if (!spec_type_matches(ns_kinds, kind)) {
             continue;
         }

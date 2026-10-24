@@ -1193,6 +1193,10 @@ const CBMType *cs_eval_expr_type(CSLSPContext *ctx, TSNode node) {
 
 /* ── identifier resolution ──────────────────────────────────────── */
 
+static const CBMType *cs_member_field_type(const CSLSPContext *ctx, const CBMRegisteredType *rt,
+                                           const char *class_qn, const char *name,
+                                           bool *found); /* defined with cs_fields_t below */
+
 static const CBMType *cs_eval_identifier_type(CSLSPContext *ctx, TSNode node) {
     char *name = cs_node_text(ctx, node);
     if (!name)
@@ -1208,14 +1212,10 @@ static const CBMType *cs_eval_identifier_type(CSLSPContext *ctx, TSNode node) {
     /* Implicit `this` member. Try to find a field on the enclosing class. */
     if (ctx->enclosing_class_qn) {
         const CBMRegisteredType *rt = cs_lookup_type_qn(ctx, ctx->enclosing_class_qn);
-        if (rt && rt->field_names) {
-            for (int i = 0; rt->field_names[i]; i++) {
-                if (strcmp(rt->field_names[i], name) == 0) {
-                    if (rt->field_types && rt->field_types[i])
-                        return rt->field_types[i];
-                    return cbm_type_unknown();
-                }
-            }
+        bool found = false;
+        const CBMType *ft = cs_member_field_type(ctx, rt, ctx->enclosing_class_qn, name, &found);
+        if (found) {
+            return ft;
         }
     }
 
@@ -1439,6 +1439,14 @@ static const CBMType *cs_eval_member_access_type(CSLSPContext *ctx, TSNode node)
     }
     if (!type_qn)
         return cbm_type_unknown();
+    /* FleetHd local patch: a member declared in this file (`this._field`). */
+    if (recv->kind != CBM_TYPE_TEMPLATE) {
+        bool local_found = false;
+        const CBMType *lt = cs_member_field_type(ctx, NULL, type_qn, fname, &local_found);
+        if (local_found && lt && lt->kind != CBM_TYPE_UNKNOWN) {
+            return lt;
+        }
+    }
     const CBMRegisteredType *rt = cs_lookup_type_qn(ctx, type_qn);
     if (rt && rt->field_names) {
         for (int i = 0; rt->field_names[i]; i++) {
@@ -3150,6 +3158,37 @@ typedef struct {
     int cap;
 } cs_fields_table_t;
 
+/* FleetHd local patch: the declared type of member `name` of `class_qn`, from this file's
+ * own declarations first, then from the registered type `rt`. *found reports a member. */
+static const CBMType *cs_member_field_type(const CSLSPContext *ctx, const CBMRegisteredType *rt,
+                                           const char *class_qn, const char *name,
+                                           bool *found) {
+    *found = false;
+    const cs_fields_table_t *tab = ctx->file_fields;
+    for (int i = 0; tab && class_qn && i < tab->count; i++) {
+        const cs_fields_t *f = &tab->items[i];
+        if (strcmp(f->class_qn, class_qn) != 0) {
+            continue;
+        }
+        for (int j = 0; j < f->count; j++) {
+            if (strcmp(f->field_names[j], name) == 0) {
+                *found = true;
+                return f->field_types[j] ? f->field_types[j] : cbm_type_unknown();
+            }
+        }
+    }
+    if (rt && rt->field_names) {
+        for (int i = 0; rt->field_names[i]; i++) {
+            if (strcmp(rt->field_names[i], name) == 0) {
+                *found = true;
+                return rt->field_types && rt->field_types[i] ? rt->field_types[i]
+                                                             : cbm_type_unknown();
+            }
+        }
+    }
+    return NULL;
+}
+
 static cs_fields_t *cs_fields_get(CBMArena *arena, cs_fields_table_t *tab, const char *class_qn) {
     for (int i = 0; i < tab->count; i++) {
         if (strcmp(tab->items[i].class_qn, class_qn) == 0)
@@ -3346,6 +3385,38 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
         }
     }
     (void)reg;
+}
+
+/* FleetHd local patch: the cross-file pass registers types from definitions, which carry
+ * no fields, so `_service.Method()` stayed untyped. Collect this file's fields against the
+ * cross-file registry, inside the file's namespace, and expose them on ctx. */
+static void cs_collect_file_fields(CSLSPContext *ctx, TSNode root, cs_fields_table_t *tab) {
+    TSNode stack[64];
+    int top = 0;
+    stack[top++] = root;
+    while (top > 0) {
+        TSNode n = stack[--top];
+        const char *k = ts_node_type(n);
+        if (strcmp(k, "namespace_declaration") == 0 ||
+            strcmp(k, "file_scoped_namespace_declaration") == 0) {
+            TSNode nm = ts_node_child_by_field_name(n, "name", 4);
+            char *ns = ts_node_is_null(nm) ? NULL : cs_node_text(ctx, nm);
+            if (ns) {
+                cs_namespace_push(ctx, ns);
+            }
+            break;
+        }
+        if (n.id != root.id && strncmp(k, "preproc_", 8) != 0) {
+            continue;
+        }
+        uint32_t nc = ts_node_named_child_count(n);
+        for (int i = (int)nc - 1; i >= 0 && top < 64; i--) {
+            stack[top++] = ts_node_named_child(n, (uint32_t)i);
+        }
+    }
+    cs_collect_class_fields(ctx, NULL, root, tab);
+    ctx->namespace_count = 0;
+    ctx->file_fields = tab;
 }
 
 /* ── extract method return types directly from AST ──────────────
@@ -3922,6 +3993,8 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
             cs_lsp_add_using(&ctx, CBM_CS_USING_NAMESPACE, "", using_targets[i], false);
         }
     }
+    cs_fields_table_t file_fields = {0};
+    cs_collect_file_fields(&ctx, root, &file_fields);
     cs_lsp_process_file(&ctx, root);
 
     if (owns)
@@ -3971,6 +4044,8 @@ void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
             cs_lsp_add_using(&ctx, CBM_CS_USING_NAMESPACE, "", using_targets[i], false);
         }
     }
+    cs_fields_table_t file_fields = {0};
+    cs_collect_file_fields(&ctx, root, &file_fields);
     cs_lsp_process_file(&ctx, root);
 
     if (owns)

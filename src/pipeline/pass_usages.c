@@ -283,6 +283,18 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
+            /* FleetHd local patch: a C# name guess must be visible from this file.
+             * Mirrors pass_parallel.c. */
+            if (tgt && lang == CBM_LANG_CSHARP) {
+                tgt = cbm_pipeline_cs_ctor_owner(ctx->gbuf, tgt);
+                tgt = cbm_pipeline_cs_visible_target(ctx->registry, ctx->gbuf, ctx->project_name,
+                                                     result, rel, tgt, usage->ref_name,
+                                                     cbm_pipeline_node_is_file_scope(src),
+                                                     ctx->repo_path, usage->site_start_byte);
+                if (!tgt) {
+                    continue;
+                }
+            }
             /* #1942/#1962: a bare Go reference can never denote a struct
              * field; the member half of a selector may. */
             if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
@@ -296,6 +308,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
                 continue;
             }
+        }
+        if (lang == CBM_LANG_CSHARP && !precise_call_reference) {
+            tgt = cbm_pipeline_cs_ctor_owner(ctx->gbuf, tgt);
         }
         if (!tgt || src->id == tgt->id) {
             continue;

@@ -1828,6 +1828,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
         if (rc == 0) {
+            /* FleetHd local patch: namespaces of the files this run did not extract. */
+            cbm_pipeline_cs_ns_add_unchanged(ctx->gbuf, ctx->project_name, ctx->repo_path);
             rc = cbm_pipeline_check_cancel(ctx);
         }
         cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",

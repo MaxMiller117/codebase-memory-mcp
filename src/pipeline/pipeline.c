@@ -800,8 +800,403 @@ CBMHashTable *cbm_pipeline_get_nsmap(void) {
     return g_nsmap;
 }
 
+/* FleetHd local patch: file QN -> declared namespace (the inverse of g_nsmap), and the
+ * set of declared namespaces, for the C# visibility check. Both own their strings. */
+static CBMHashTable *g_file_nsmap = NULL;
+static CBMHashTable *g_cs_namespaces = NULL;
+
+static void free_key_value(const char *key, void *value, void *ud) {
+    (void)ud;
+    free((void *)key);
+    free(value);
+}
+
+static void free_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    free((void *)key);
+}
+
+/* Records `file_qn` (ownership taken) as declaring namespace `ns`. */
+static void cs_ns_record(char *file_qn, const char *ns) {
+    if (!file_qn || cbm_ht_has(g_file_nsmap, file_qn)) {
+        free(file_qn);
+        return;
+    }
+    char *value = strdup(ns);
+    if (!value) {
+        free(file_qn);
+        return;
+    }
+    cbm_ht_set(g_file_nsmap, file_qn, value);
+    if (g_cs_namespaces && !cbm_ht_has(g_cs_namespaces, ns)) {
+        char *key = strdup(ns);
+        if (key) {
+            cbm_ht_set(g_cs_namespaces, key, (void *)1);
+        }
+    }
+}
+
+static void file_nsmap_add_entry(const char *key, void *value, void *ud) {
+    (void)ud;
+    for (const char *p = value; p && *p;) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char *file_qn = malloc(len + 1);
+        if (file_qn) {
+            memcpy(file_qn, p, len);
+            file_qn[len] = '\0';
+        }
+        cs_ns_record(file_qn, key);
+        p = end ? end + 1 : p + len;
+    }
+}
+
 void cbm_pipeline_set_nsmap(CBMHashTable *map) {
     g_nsmap = map;
+    if (g_file_nsmap) {
+        cbm_ht_foreach(g_file_nsmap, free_key_value, NULL);
+        cbm_ht_free(g_file_nsmap);
+        g_file_nsmap = NULL;
+    }
+    if (g_cs_namespaces) {
+        cbm_ht_foreach(g_cs_namespaces, free_key, NULL);
+        cbm_ht_free(g_cs_namespaces);
+        g_cs_namespaces = NULL;
+    }
+    /* CBM_FLEETHD_NO_CS_VISIBILITY=1 turns the C# visibility check off. */
+    const char *off = getenv("CBM_FLEETHD_NO_CS_VISIBILITY");
+    if (map && !(off && off[0] == '1')) {
+        g_file_nsmap = cbm_ht_create(CBM_SZ_64);
+        g_cs_namespaces = cbm_ht_create(CBM_SZ_64);
+        if (g_file_nsmap) {
+            cbm_ht_foreach(map, file_nsmap_add_entry, NULL);
+        }
+    }
+}
+
+/* The first `namespace X` declaration in C# source text, copied to `out`. */
+static bool cs_scan_namespace(const char *text, char *out, size_t out_size) {
+    bool in_block_comment = false;
+    for (const char *line = text; line && *line;) {
+        const char *next = strchr(line, '\n');
+        const char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || (unsigned char)*p == 0xEF ||
+               (unsigned char)*p == 0xBB || (unsigned char)*p == 0xBF) {
+            p++;
+        }
+        if (in_block_comment) {
+            const char *close = strstr(p, "*/");
+            in_block_comment = !close || (next && close > next);
+        } else if (strncmp(p, "/*", 2) == 0) {
+            const char *close = strstr(p + 2, "*/");
+            in_block_comment = !close || (next && close > next);
+        } else if (strncmp(p, "namespace", 9) == 0 && (p[9] == ' ' || p[9] == '\t')) {
+            p += 9;
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            size_t n = 0;
+            while (n + 1 < out_size && (isalnum((unsigned char)p[n]) || p[n] == '_' ||
+                                        p[n] == '.' || p[n] == '@')) {
+                n++;
+            }
+            out[n] = '\0';
+            memcpy(out, p, n);
+            return n > 0;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    return false;
+}
+
+typedef struct {
+    const char *project;
+    const char *repo_path;
+} cs_ns_scan_ctx_t;
+
+static void cs_ns_scan_visitor(const cbm_gbuf_node_t *node, void *userdata) {
+    const cs_ns_scan_ctx_t *sc = userdata;
+    size_t len = node->file_path ? strlen(node->file_path) : 0;
+    if (!node->label || strcmp(node->label, "File") != 0 || len < 4 ||
+        strcmp(node->file_path + len - 3, ".cs") != 0) {
+        return;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(sc->project, node->file_path, "__file__");
+    if (!file_qn || cbm_ht_has(g_file_nsmap, file_qn)) {
+        free(file_qn);
+        return;
+    }
+    char path[CBM_SZ_2K];
+    snprintf(path, sizeof(path), "%s/%s", sc->repo_path, node->file_path);
+    FILE *f = fopen(path, "rb");
+    char text[CBM_SZ_64K];
+    size_t n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+    if (f) {
+        fclose(f);
+    }
+    text[n] = '\0';
+    char ns[CBM_SZ_512];
+    if (n > 0 && cs_scan_namespace(text, ns, sizeof(ns))) {
+        cs_ns_record(file_qn, ns);
+    } else {
+        free(file_qn);
+    }
+}
+
+void cbm_pipeline_cs_ns_add_unchanged(const cbm_gbuf_t *gb, const char *project,
+                                      const char *repo_path) {
+    if (!g_file_nsmap || !gb || !project || !repo_path) {
+        return;
+    }
+    cs_ns_scan_ctx_t sc = {.project = project, .repo_path = repo_path};
+    cbm_gbuf_foreach_node(gb, cs_ns_scan_visitor, &sc);
+}
+
+/* `using A = N;` makes the qualifier `A.X` mean `N.X`. */
+static bool cs_alias_reaches(const CBMFileResult *caller, const char *ns, const char *qual,
+                             size_t qlen) {
+    const char *dot = memchr(qual, '.', qlen);
+    size_t head = dot ? (size_t)(dot - qual) : qlen;
+    for (int i = 0; i < caller->imports.count; i++) {
+        const char *local = caller->imports.items[i].local_name;
+        const char *mp = caller->imports.items[i].module_path;
+        if (!local || !mp || strlen(local) != head || strncmp(local, qual, head) != 0) {
+            continue;
+        }
+        const char *last = strrchr(mp, '.');
+        if (strcmp(last ? last + 1 : mp, local) == 0) {
+            continue; /* a plain `using N;`, not an alias */
+        }
+        size_t mlen = strlen(mp);
+        if (strncmp(ns, mp, mlen) == 0 && strlen(ns) == mlen + (qlen - head) &&
+            strncmp(ns + mlen, qual + head, qlen - head) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `Q.T` names T in namespace Q, in E.Q for an enclosing namespace E of the caller, or in
+ * the namespace an alias at the head of Q stands for. */
+static bool cs_qualifier_reaches(const CBMFileResult *caller, const char *ns,
+                                 const char *ref_name) {
+    const char *dot = ref_name ? strrchr(ref_name, '.') : NULL;
+    if (!dot) {
+        return false;
+    }
+    size_t qlen = (size_t)(dot - ref_name);
+    if (cs_alias_reaches(caller, ns, ref_name, qlen)) {
+        return true;
+    }
+    size_t nlen = strlen(ns);
+    if (nlen < qlen || strncmp(ns + nlen - qlen, ref_name, qlen) != 0) {
+        return false;
+    }
+    if (nlen == qlen) {
+        return true;
+    }
+    size_t elen = nlen - qlen - 1;
+    const char *own = caller->namespace_name;
+    return ns[elen] == '.' && own && strncmp(own, ns, elen) == 0 &&
+           (own[elen] == '\0' || own[elen] == '.');
+}
+
+bool cbm_pipeline_cs_target_visible(const char *project, const CBMFileResult *caller,
+                                    const char *target_file_path, const char *ref_name) {
+    if (!g_file_nsmap || !caller || !target_file_path) {
+        return true;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project, target_file_path, "__file__");
+    const char *ns = file_qn ? cbm_ht_get(g_file_nsmap, file_qn) : NULL;
+    free(file_qn);
+    if (!ns) {
+        return true; /* global namespace, or a file outside the map */
+    }
+    size_t ns_len = strlen(ns);
+    /* The caller's namespace and every enclosing namespace see `ns`. */
+    const char *own = caller->namespace_name;
+    if (own && strncmp(own, ns, ns_len) == 0 && (own[ns_len] == '\0' || own[ns_len] == '.')) {
+        return true;
+    }
+    /* `using N;`, and `using static N.T;` / `using A = N.T;` for a type T in N. A
+     * namespace import (a declared namespace) does not make its parent visible. */
+    for (int i = 0; i < caller->imports.count; i++) {
+        const char *mp = caller->imports.items[i].module_path;
+        if (!mp || strncmp(mp, ns, ns_len) != 0) {
+            continue;
+        }
+        if (mp[ns_len] == '\0') {
+            return true;
+        }
+        if (mp[ns_len] == '.' && !strchr(mp + ns_len + 1, '.') &&
+            !(g_cs_namespaces && cbm_ht_has(g_cs_namespaces, mp))) {
+            return true;
+        }
+    }
+    return cs_qualifier_reaches(caller, ns, ref_name);
+}
+
+static bool cs_same_repo(const char *a, const char *b) {
+    const char *sa = a ? strchr(a, '/') : NULL;
+    const char *sb = b ? strchr(b, '/') : NULL;
+    return sa && sb && sa - a == sb - b && strncmp(a, b, (size_t)(sa - a)) == 0;
+}
+
+/* A member is reached through a receiver whose type needs no `using`, so a member
+ * target also counts as visible inside the caller's own repo. */
+static bool cs_member_visible(const char *project, const CBMFileResult *caller,
+                              const char *caller_rel, const char *target_file_path,
+                              const char *ref_name) {
+    return cs_same_repo(caller_rel, target_file_path) ||
+           cbm_pipeline_cs_target_visible(project, caller, target_file_path, ref_name);
+}
+
+bool cbm_pipeline_cs_qn_visible(const cbm_gbuf_t *gb, const char *project,
+                                const CBMFileResult *caller, const char *caller_rel,
+                                const char *qn, const char *ref_name) {
+    const cbm_gbuf_node_t *node = qn && qn[0] ? cbm_gbuf_find_by_qn(gb, qn) : NULL;
+    return !node || cs_member_visible(project, caller, caller_rel, node->file_path, ref_name);
+}
+
+static bool cs_type_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Struct") == 0 || strcmp(label, "Enum") == 0);
+}
+
+static bool cs_file(const char *path) {
+    size_t n = path ? strlen(path) : 0;
+    return n > 3 && strcmp(path + n - 3, ".cs") == 0;
+}
+
+/* True when `name` is one dot-separated segment of `path`. */
+static bool cs_path_segment(const char *path, const char *name, size_t name_len) {
+    for (const char *p = path; p && *p;) {
+        const char *end = strchr(p, '.');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == name_len && strncmp(p, name, len) == 0) {
+            return true;
+        }
+        p = end ? end + 1 : p + len;
+    }
+    return false;
+}
+
+/* A reference named like a segment of the file's namespace or a `using` path is
+ * most often that declaration's own token (`namespace FleetHd.Models`). */
+static bool cs_namespace_token(const CBMFileResult *caller, const char *name) {
+    size_t len = strlen(name);
+    if (cs_path_segment(caller->namespace_name, name, len)) {
+        return true;
+    }
+    for (int i = 0; i < caller->imports.count; i++) {
+        if (cs_path_segment(caller->imports.items[i].module_path, name, len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The qualifier written before a reference at byte `site_start` of `rel` (`Entity.` in
+ * `Entity.Foo`), joined with `name` into `out`. False when the site has none. */
+static bool cs_site_qualified_ref(const char *repo_path, const char *rel, uint32_t site_start,
+                                  const char *name, char *out, size_t out_size) {
+    if (!repo_path || !rel || !name || site_start == 0) {
+        return false;
+    }
+    char path[CBM_SZ_2K];
+    snprintf(path, sizeof(path), "%s/%s", repo_path, rel);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char buf[CBM_SZ_256];
+    uint32_t from = site_start > sizeof(buf) ? site_start - (uint32_t)sizeof(buf) : 0;
+    size_t n = fseek(f, (long)from, SEEK_SET) == 0 ? fread(buf, 1, site_start - from, f) : 0;
+    fclose(f);
+    if (n == 0 || buf[n - 1] != '.') {
+        return false;
+    }
+    size_t end = n - 1;
+    size_t start = end;
+    while (start > 0 && (isalnum((unsigned char)buf[start - 1]) || buf[start - 1] == '_' ||
+                         buf[start - 1] == '.')) {
+        start--;
+    }
+    if (start == end) {
+        return false;
+    }
+    int written = snprintf(out, out_size, "%.*s.%s", (int)(end - start), buf + start, name);
+    return written > 0 && (size_t)written < out_size;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_cs_visible_target(const cbm_registry_t *r,
+                                                      const cbm_gbuf_t *gb, const char *project,
+                                                      const CBMFileResult *caller,
+                                                      const char *caller_rel,
+                                                      const cbm_gbuf_node_t *guess,
+                                                      const char *ref_name, bool file_scope,
+                                                      const char *repo_path,
+                                                      uint32_t site_start) {
+    if (!guess || !g_file_nsmap) {
+        return guess;
+    }
+    const char *name = ref_name ? strrchr(ref_name, '.') : NULL;
+    name = name ? name + 1 : ref_name;
+    if (!cs_type_label(guess->label)) {
+        if (file_scope && name && cs_namespace_token(caller, name)) {
+            return NULL;
+        }
+        return cs_member_visible(project, caller, caller_rel, guess->file_path, ref_name)
+                   ? guess
+                   : NULL;
+    }
+    if (cbm_pipeline_cs_target_visible(project, caller, guess->file_path, ref_name)) {
+        return guess;
+    }
+    /* A bare usage may stand for `Q.Foo` in the source: read the qualifier there. */
+    char qualified[CBM_SZ_512];
+    if (ref_name && !strchr(ref_name, '.') &&
+        cs_site_qualified_ref(repo_path, caller_rel, site_start, ref_name, qualified,
+                              sizeof(qualified))) {
+        ref_name = qualified;
+        if (cbm_pipeline_cs_target_visible(project, caller, guess->file_path, ref_name)) {
+            return guess;
+        }
+    }
+    /* A type name: the visible type of that name, if exactly one exists. */
+    const char **qns = NULL;
+    int count = 0;
+    if (!name || !name[0] || cbm_registry_find_by_name(r, name, &qns, &count) != 0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gb, qns[i]);
+        if (!node || node == guess || !cs_type_label(node->label) || !cs_file(node->file_path) ||
+            !cbm_pipeline_cs_target_visible(project, caller, node->file_path, ref_name)) {
+            continue;
+        }
+        if (found) {
+            return NULL;
+        }
+        found = node;
+    }
+    return found;
+}
+
+const char *cbm_pipeline_cs_call_type_qn(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                         const char *project, const CBMFileResult *caller,
+                                         const char *caller_rel, const char *qn,
+                                         const char *callee_name) {
+    const cbm_gbuf_node_t *node = qn && qn[0] ? cbm_gbuf_find_by_qn(gb, qn) : NULL;
+    if (!node || !cs_type_label(node->label)) {
+        return qn;
+    }
+    const cbm_gbuf_node_t *visible =
+        cbm_pipeline_cs_visible_target(r, gb, project, caller, caller_rel, node, callee_name,
+                                       false, NULL, 0);
+    return visible ? visible->qualified_name : qn;
 }
 
 bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p) {

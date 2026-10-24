@@ -1468,8 +1468,8 @@ static const char MCP_SERVER_INSTRUCTIONS[] =
     "query_graph runs multi-hop Cypher queries; get_architecture summarizes structure; "
     "detect_changes maps the current diff to affected symbols. Grep and file reads fit literal "
     "text, config values, comments and non-code files better; search_code combines text search "
-    "with graph context. The session project's index refreshes automatically; other projects "
-    "need index_repository. check_index_coverage tells whether a cited file was fully indexed. "
+    "with graph context. The session project's index refreshes automatically only when "
+    "auto_watch is on; otherwise indexes change only on index_repository. check_index_coverage tells whether a cited file was fully indexed. "
     "Results are paginated.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
@@ -4280,6 +4280,10 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         return NULL;
     }
     char *file_like = bm25_file_pattern_like(file_pattern);
+    /* A scoped query (file_pattern/label/kind/ns) ranks the full match set: the global top-N
+     * window can hold zero in-scope rows on a large multi-repo index. LIMIT -1 = no limit. */
+    bool scoped = file_like != NULL || (label && label[0]) || (kind && kind[0]) || (ns && ns[0]);
+    int inner_limit = scoped ? -1 : BM25_INNER_LIMIT;
 
     /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
      *
@@ -4354,7 +4358,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
     sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
-    sqlite3_bind_int(stmt, BM25_BIND_INNER, BM25_INNER_LIMIT);
+    sqlite3_bind_int(stmt, BM25_BIND_INNER, inner_limit);
     if (file_like) {
         sqlite3_bind_text(stmt, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     } else {
@@ -4408,7 +4412,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                               MCP_SQLITE_TRANSIENT);
             sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
+            sqlite3_bind_int(cs, BM25_BIND_LIMIT, inner_limit);
             if (file_like) {
                 sqlite3_bind_text(cs, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
                                   MCP_SQLITE_TRANSIENT);
@@ -4444,8 +4448,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * a window-local count as the complete match count. This is global to the
      * FTS table; saturation is therefore conservatively reported even when
      * later project/path filters might discard the hidden candidates. */
-    bool candidate_window_saturated = true;
-    {
+    bool candidate_window_saturated = !scoped;
+    if (!scoped) {
         const char *probe_sql = "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1 "
                                 "ORDER BY bm25(nodes_fts), rowid LIMIT 1 OFFSET ?2";
         sqlite3_stmt *probe = NULL;

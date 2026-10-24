@@ -1152,6 +1152,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * spark.Spark.get` + `get("/x", handler)`) is exactly a bare call bound by
      * a package specifier. Suppressing only the plain-CALLS fall-through keeps
      * every Route node and service edge main-identical. */
+    /* FleetHd local patch: a C# type guess (`new T()`) the file cannot see moves to the
+     * one visible type. MUST match pass_parallel.c. */
+    if (lang == CBM_LANG_CSHARP) {
+        res.qualified_name =
+            cbm_pipeline_cs_call_type_qn(ctx->registry, ctx->gbuf, ctx->project_name, result, rel,
+                                         res.qualified_name, call->callee_name);
+    }
     bool drop_plain_call =
         (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
          !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
@@ -1173,7 +1180,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                             cbm_pipeline_get_nsmap()) ||
         /* MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry));
+         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry)) ||
+        /* FleetHd local patch: a C# name guess this file cannot see. MUST match
+         * pass_parallel.c. */
+        (lang == CBM_LANG_CSHARP &&
+         !cbm_pipeline_cs_qn_visible(ctx->gbuf, ctx->project_name, result, rel,
+                                     res.qualified_name, call->callee_name));
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library

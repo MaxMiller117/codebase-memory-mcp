@@ -770,6 +770,52 @@ cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char
 CBMHashTable *cbm_pipeline_get_nsmap(void);
 void cbm_pipeline_set_nsmap(CBMHashTable *map);
 
+/* FleetHd local patch: true when C# code in `caller` can name a symbol declared in
+ * `target_file_path`: its namespace encloses the caller's, a `using` imports it, or the
+ * qualifier of `ref_name` (`Q.T`, may be NULL) reaches it. True when the namespace map
+ * is absent or the target is in the global namespace. */
+bool cbm_pipeline_cs_target_visible(const char *project, const CBMFileResult *caller,
+                                    const char *target_file_path, const char *ref_name);
+
+/* FleetHd local patch: for a C# call guessed onto a type (`new T()`) that the caller cannot
+ * see, the QN of the one visible type of that name; else `qn` unchanged. */
+const char *cbm_pipeline_cs_call_type_qn(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                         const char *project, const CBMFileResult *caller,
+                                         const char *caller_rel, const char *qn,
+                                         const char *callee_name);
+
+/* FleetHd local patch: an incremental run extracts only changed files, so the namespace
+ * map lacks the others. Reads the first `namespace` line of every other `.cs` File node. */
+void cbm_pipeline_cs_ns_add_unchanged(const cbm_gbuf_t *gb, const char *project,
+                                      const char *repo_path);
+
+/* FleetHd local patch: a member target `qn` (a call) is visible when its namespace is,
+ * or when it is in the caller's repo. True when `qn` has no node. */
+bool cbm_pipeline_cs_qn_visible(const cbm_gbuf_t *gb, const char *project,
+                                const CBMFileResult *caller, const char *caller_rel,
+                                const char *qn, const char *ref_name);
+
+/* FleetHd local patch: the C# name guess `guess` checked for visibility. A type keeps
+ * `guess` when visible, else takes the one visible type named like `ref_name`, else NULL.
+ * A member keeps `guess` when visible or in the caller's repo, else NULL; at file scope
+ * (`file_scope`) a member named like a namespace or `using` segment is NULL. For a bare
+ * type name, the qualifier written at byte `site_start` of the source (under `repo_path`)
+ * also counts. */
+const cbm_gbuf_node_t *cbm_pipeline_cs_visible_target(const cbm_registry_t *r,
+                                                      const cbm_gbuf_t *gb, const char *project,
+                                                      const CBMFileResult *caller,
+                                                      const char *caller_rel,
+                                                      const cbm_gbuf_node_t *guess,
+                                                      const char *ref_name, bool file_scope,
+                                                      const char *repo_path,
+                                                      uint32_t site_start);
+
+/* FleetHd local patch: true for a usage source that is the file itself, not a symbol. */
+static inline bool cbm_pipeline_node_is_file_scope(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Module") == 0 || strcmp(node->label, "File") == 0);
+}
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */

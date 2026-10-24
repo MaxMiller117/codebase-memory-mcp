@@ -3409,6 +3409,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+        /* FleetHd local patch: a C# type guess (`new T()`) the file cannot see moves to
+         * the one visible type. MUST match pass_calls.c. */
+        if (lang == CBM_LANG_CSHARP && !lsp_target) {
+            res.qualified_name =
+                cbm_pipeline_cs_call_type_qn(rc->registry, rc->main_gbuf, rc->project_name,
+                                             result, rel, res.qualified_name, call->callee_name);
+        }
         /* The member guard's one exemption — MUST match pass_calls.c exactly. */
         /* #1355: same guard as pass_calls.c, and joined to drop_plain_call for
          * the same reason — a `continue` here would also skip route/HTTP/CONFIG
@@ -3436,7 +3443,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                 cbm_pipeline_get_nsmap()) ||
             /* MUST match pass_calls.c exactly. */
             (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call, rc->registry));
+             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call, rc->registry)) ||
+            /* FleetHd local patch: a C# name guess this file cannot see. MUST match
+             * pass_calls.c, where every `res` here is already a registry guess. */
+            (lang == CBM_LANG_CSHARP && !lsp_target &&
+             !cbm_pipeline_cs_qn_visible(rc->main_gbuf, rc->project_name, result, rel,
+                                         res.qualified_name, call->callee_name));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -3758,6 +3770,19 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
+            /* FleetHd local patch: a C# name guess must be visible from this file.
+             * Mirrors pass_usages.c. */
+            if (tgt && lang == CBM_LANG_CSHARP) {
+                tgt = cbm_pipeline_cs_ctor_owner(rc->main_gbuf, tgt);
+                tgt = cbm_pipeline_cs_visible_target(rc->registry, rc->main_gbuf,
+                                                     rc->project_name, result, rel, tgt,
+                                                     usage->ref_name,
+                                                     cbm_pipeline_node_is_file_scope(src),
+                                                     rc->repo_path, usage->site_start_byte);
+                if (!tgt) {
+                    continue;
+                }
+            }
             /* #1942/#1962: a bare Go reference can never denote a struct
              * field; the member half of a selector may. */
             if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
@@ -3771,6 +3796,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
                 continue;
             }
+        }
+        if (lang == CBM_LANG_CSHARP && !precise_call_reference) {
+            tgt = cbm_pipeline_cs_ctor_owner(rc->main_gbuf, tgt);
         }
         if (!tgt || src->id == tgt->id) {
             continue;
