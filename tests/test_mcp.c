@@ -4435,6 +4435,55 @@ TEST(tool_search_graph_bm25_reports_candidate_saturation) {
     PASS();
 }
 
+/* FleetHd local patch 2: a scoped BM25 query (file_pattern) ranks the full match set. The
+ * one in-scope row is inserted last, so the global 2,000-candidate window excludes it. */
+TEST(tool_search_graph_bm25_scoped_query_ranks_full_match_set) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-scoped";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-scoped"), CBM_STORE_OK);
+    for (int i = 0; i < 2002; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-scoped.fn_%04d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "scopedneedle",
+                           .qualified_name = qn,
+                           .file_path = i < 2001 ? "many.c" : "other/target.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-scoped\",\"query\":\"scopedneedle\","
+             "\"file_pattern\":\"other/*\",\"limit\":10,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    if (!strstr(inner, "\"total\":1,") || !strstr(inner, "\"total_relation\":\"eq\"")) {
+        printf("  scoped BM25 response: %.300s\n", inner);
+    }
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    ASSERT_NOT_NULL(strstr(inner, "other/target.c"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Shared fixture for the two BM25 findability probes (2026-09-16, measured on
  * JetBrains/Exposed and django/django): a Class named exactly like the query,
  * that class's own Methods, and test Methods whose long names repeat the
@@ -25110,6 +25159,7 @@ SUITE(mcp) {
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
+    RUN_TEST(tool_search_graph_bm25_scoped_query_ranks_full_match_set);
     RUN_TEST(tool_search_graph_bm25_applies_label_filter);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);

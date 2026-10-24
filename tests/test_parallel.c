@@ -2905,6 +2905,108 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     PASS();
 }
 
+/* FleetHd local patches 3 to 6 (docs/LOCAL_PATCHES.md). Each top-level folder is one
+ * repo. A C# name guess binds the type the file can see, never its constructor; an
+ * alias, a `using` inside `#if` and a typed field all count; a framework call (`Ok()`)
+ * does not bind a same-named method in another repo. */
+TEST(parallel_csharp_fleethd_visibility_patches) {
+    static const char a_dto[] = "namespace RepoA.Dtos;\n"
+                                "public class VehicleDto {\n    public VehicleDto() { }\n}\n";
+    static const char b_dto[] = "namespace RepoB.Dtos;\n"
+                                "public class VehicleDto {\n    public VehicleDto() { }\n}\n";
+    static const char user[] = "using RepoB.Dtos;\nnamespace RepoC;\npublic class User {\n"
+                               "    public VehicleDto Load() { return new VehicleDto(); }\n}\n";
+    static const char alias_user[] = "using RB = RepoB;\nnamespace RepoC;\npublic class AliasUser {\n"
+                                     "    public RB.Dtos.VehicleDto Get() { return null; }\n}\n";
+    static const char guarded[] = "#if FEATURE_X\nusing RepoB.Dtos;\n#endif\nnamespace RepoC;\n"
+                                  "public class GuardedUser {\n"
+                                  "    public VehicleDto Get() { return null; }\n}\n";
+    static const char results[] = "namespace RepoD.Web;\npublic class Results {\n"
+                                  "    public void Ok() { }\n}\n";
+    static const char controller[] = "namespace RepoC;\npublic class TruckController : ControllerBase {\n"
+                                     "    public void Get() { Ok(); }\n}\n";
+    static const char regular[] = "namespace RepoA.Api;\npublic class RegularController {\n"
+                                  "    public int GetByVinAsync(string vin) { return 1; }\n}\n";
+    static const char other[] = "namespace RepoD.Api;\npublic class AaaController {\n"
+                                "    public int GetByVinAsync(string vin) { return 2; }\n}\n";
+    static const char tests[] = "using RepoA.Api;\nnamespace RepoC.Tests;\npublic class ControllerTests {\n"
+                                "    private RegularController _sut;\n"
+                                "    public void Call() { _sut.GetByVinAsync(\"v\"); }\n}\n";
+    static const char *rels[] = {
+        "repoA/src/VehicleDto.cs",    "repoB/src/VehicleDto.cs",  "repoC/src/User.cs",
+        "repoC/src/AliasUser.cs",     "repoC/src/Guarded.cs",     "repoD/src/Results.cs",
+        "repoC/src/Controller.cs",    "repoA/src/RegularController.cs",
+        "aaaRepo/src/AaaController.cs", "repoC/src/ControllerTests.cs",
+    };
+    const char *srcs[] = {a_dto,      b_dto,   user,  alias_user, guarded,
+                          results,    controller, regular, other, tests};
+    enum { N_FILES = 10, N_CHECKS = 9 };
+    const char *project = "cbm_fleethd_cs";
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_fleethd_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write C# FleetHd fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *a_class = "cbm_fleethd_cs.repoA.src.VehicleDto.VehicleDto";
+    const char *b_class = "cbm_fleethd_cs.repoB.src.VehicleDto.VehicleDto";
+    const char *b_ctor = "cbm_fleethd_cs.repoB.src.VehicleDto.VehicleDto.VehicleDto";
+    const char *ok_method = "cbm_fleethd_cs.repoD.src.Results.Results.Ok";
+    const char *regular_get = "cbm_fleethd_cs.repoA.src.RegularController.RegularController."
+                              "GetByVinAsync";
+    const char *other_get = "cbm_fleethd_cs.aaaRepo.src.AaaController.AaaController.GetByVinAsync";
+    bool ok[2][N_CHECKS];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "User.Load", b_class, "USAGE");
+        ok[g][1] = !has_edge_from_callable_to_qn(gb, "User.Load", a_class, "USAGE");
+        ok[g][2] = !has_edge_from_callable_to_qn(gb, "User.Load", b_ctor, "USAGE");
+        ok[g][3] = has_edge_from_callable_to_qn(gb, "AliasUser.Get", b_class, "USAGE");
+        ok[g][4] = !has_edge_from_callable_to_qn(gb, "AliasUser.Get", a_class, "USAGE");
+        ok[g][5] = has_edge_from_callable_to_qn(gb, "GuardedUser.Get", b_class, "USAGE");
+        ok[g][6] = !has_edge_from_callable_to_qn(gb, "TruckController.Get", ok_method, "CALLS");
+        ok[g][7] = has_edge_from_callable_to_qn(gb, "ControllerTests.Call", regular_get, "CALLS");
+        ok[g][8] = !has_edge_from_callable_to_qn(gb, "ControllerTests.Call", other_get, "CALLS");
+        for (int k = 0; k < N_CHECKS; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  C# FleetHd diagnostic %s: using=%d/%d ctor=%d alias=%d/%d if_using=%d "
+                   "framework_call=%d field_call=%d/%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
@@ -5573,6 +5675,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
     RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
+    RUN_TEST(parallel_csharp_fleethd_visibility_patches);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);

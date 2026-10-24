@@ -46,6 +46,19 @@ every Claude Code session.
 7. **Server instructions state the watcher dependency** (`src/mcp/mcp.c`, `MCP_SERVER_INSTRUCTIONS`). The text
    says that indexes refresh automatically only when `auto_watch` is on. FleetHd runs with the watcher off.
 
+## Tests
+
+Each test below is in upstream's suite and fails when its patch is removed (checked 2026-10-24):
+
+| Test | Patches |
+|---|---|
+| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 3, 4, 5, 6 |
+| `incr_csharp_visibility_matches_full_run` (`tests/test_incremental.c`) | 4 (incremental runs) |
+| `tool_search_graph_bm25_scoped_query_ranks_full_match_set` (`tests/test_mcp.c`) | 2 |
+| `repro_call_argument_ts_lsp_cannot_rescue` (upstream test) | 1 (TypeScript annotations) |
+
+## Not carried
+
 The v0.11.0 patch for `NOT` over a variable that is not yet bound (`src/cypher/cypher.c`) is not carried. Upstream
 #2253 (v0.12.0) makes the early `WHERE` pass three-valued, and that fixes the same query.
 

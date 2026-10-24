@@ -85,7 +85,9 @@ Then update the pinned tag in the plugin README with a PR on `fleet-hd-claude` (
    different namespaces and a third repo that `using`s one of them, change only the third file, and index again.
 
    Run upstream's suite on a copy inside WSL (`make -f Makefile.cbm test-par`). Copy with `tar
-   --no-same-permissions` and `chmod -R go-w`: a world-writable folder fails the `cli` install tests.
+   --no-same-permissions` and `chmod -R go-w`: a world-writable folder fails the `cli` install tests. The
+   fork's own tests are listed in `docs/LOCAL_PATCHES.md` under **Tests**; a merge conflict in one of them means
+   upstream changed the behaviour that the patch depends on.
 
    To measure what a resolver change removes or adds, index a second copy with the change off (for patch 4,
    `CBM_FLEETHD_NO_CS_VISIBILITY=1`) and diff the `edges` tables of the two databases.

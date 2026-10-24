@@ -3100,6 +3100,53 @@ TEST(tool_arch_empty_aspects) {
     PASS();
 }
 
+/* FleetHd local patch 4: an incremental run binds a C# name guess like a full run.
+ * Only User.cs changes, so the namespaces of the two VehicleDto files must come from
+ * cbm_pipeline_cs_ns_add_unchanged, not from extraction. */
+TEST(incr_csharp_visibility_matches_full_run) {
+    static const char *const fixture[][2] = {
+        {"repoA/src/VehicleDto.cs", "namespace RepoA.Dtos\n{\n    public class VehicleDto { }\n}\n"},
+        {"repoB/src/VehicleDto.cs", "namespace RepoB.Dtos\n{\n    public class VehicleDto { }\n}\n"},
+        {"repoC/src/User.cs", "using RepoB.Dtos;\n\nnamespace RepoC\n{\n    public class User\n"
+                              "    {\n        public VehicleDto Load() { return null; }\n    }\n}\n"},
+    };
+    char dir[640];
+    snprintf(dir, sizeof(dir), "%s/cs_visibility", g_tmpdir);
+    char path[900];
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, fixture[i][0]);
+        ASSERT_EQ(th_write_file(path, fixture[i][1]), 0);
+    }
+    char *project = cbm_project_name_from_path(dir);
+    ASSERT_NOT_NULL(project);
+    const char *query = "MATCH (m {name:'Load'})-[:USAGE]->(t {name:'VehicleDto'}) RETURN t.file_path";
+    bool full_ok = false;
+    bool incr_ok = false;
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            snprintf(path, sizeof(path), "%s/repoC/src/User.cs", dir);
+            th_append_file(path, "// edited\n");
+        }
+        char *resp = call_tool("index_repository", "{\"repo_path\":\"%s\"}", dir);
+        ASSERT_NOT_NULL(resp);
+        free(resp);
+        resp = call_tool("query_graph", "{\"project\":\"%s\",\"query\":\"%s\"}", project, query);
+        ASSERT_NOT_NULL(resp);
+        bool ok = strstr(resp, "repoB/src/VehicleDto.cs") && !strstr(resp, "repoA/src/VehicleDto.cs");
+        if (!ok) {
+            printf("  C# visibility %s run: %.300s\n", run == 0 ? "full" : "incremental", resp);
+        }
+        *(run == 0 ? &full_ok : &incr_ok) = ok;
+        free(resp);
+    }
+    char *resp = call_tool("delete_project", "{\"project\":\"%s\"}", project);
+    free(resp);
+    free(project);
+    ASSERT_TRUE(full_ok);
+    ASSERT_TRUE(incr_ok);
+    PASS();
+}
+
 /* ── delete_project: real delete + verify ──────────────────────── */
 /* NOTE: This is destructive — must run LAST */
 
@@ -3421,6 +3468,9 @@ SUITE(incremental) {
     /* Phase 40: index_repository mode=full + arch empty aspects */
     RUN_TEST(tool_index_mode_full);
     RUN_TEST(tool_arch_empty_aspects);
+
+    /* FleetHd local patch 4: incremental runs keep C# namespace visibility */
+    RUN_TEST(incr_csharp_visibility_matches_full_run);
 
     /* Phase 41: delete_project real flow (MUST BE LAST) */
     RUN_TEST(tool_delete_and_verify);
