@@ -400,6 +400,21 @@ static void extract_csharp_type_refs(CBMExtractCtx *ctx, TSNode type_node,
     } else if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
                strcmp(kind, "qualified_name") == 0) {
         add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), enclosing_qn);
+        // `Ns.List<T>`: the type arguments sit in the generic_name segment.
+        uint32_t nc = ts_node_named_child_count(type_node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode seg = ts_node_named_child(type_node, i);
+            if (strcmp(ts_node_type(seg), "generic_name") != 0) {
+                continue;
+            }
+            uint32_t sc = ts_node_named_child_count(seg);
+            for (uint32_t j = 0; j < sc; j++) {
+                TSNode args = ts_node_named_child(seg, j);
+                if (strcmp(ts_node_type(args), "type_argument_list") == 0) {
+                    extract_csharp_type_refs(ctx, args, enclosing_qn);
+                }
+            }
+        }
     } else if (strcmp(kind, "nullable_type") == 0) {
         // T? — unwrap to T
         if (ts_node_child_count(type_node) > 0) {

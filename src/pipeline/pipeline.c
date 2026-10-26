@@ -1026,8 +1026,10 @@ bool cbm_pipeline_cs_target_visible(const char *project, const CBMFileResult *ca
         if (!mp || strncmp(mp, ns, ns_len) != 0) {
             continue;
         }
-        if (mp[ns_len] == '\0') {
-            return true;
+        const char *local = caller->imports.items[i].local_name;
+        const char *last = strrchr(mp, '.');
+        if (mp[ns_len] == '\0' && !(local && strcmp(local, last ? last + 1 : mp) != 0)) {
+            return true; /* `using N;`; an alias `using A = N;` imports no bare names */
         }
         if (mp[ns_len] == '.' && !strchr(mp + ns_len + 1, '.') &&
             !(g_cs_namespaces && cbm_ht_has(g_cs_namespaces, mp))) {

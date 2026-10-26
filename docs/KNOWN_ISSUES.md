@@ -65,6 +65,17 @@ do not fall back to a name guess.
 Local patch 4 reads a reference's qualifier from the source, but 9 of the 21,928 type edges that it removes name
 a type that the file does reach. These are rare forms that the qualifier reader does not parse.
 
+## 6. Visibility filter limits (Codex review, 2026-10-26)
+
+Local patch 4 does not model these C# forms. Each count below is from the main checkouts on 2026-10-26.
+
+| Form | Effect | Count |
+|---|---|---:|
+| `global using N;` in one file | Other files of the project do not see N, so a correct guessed edge can drop | 1 file with a FleetHd namespace (a test project) |
+| More than one namespace in one file | Every type of the file gets the first namespace | 0 of 14,781 `.cs` files |
+| `namespace` alone on a line, or after `*/` on the same line | An incremental run does not read the namespace of an unchanged file | 0 files |
+| `using A;` plus an explicit `B.T` where A and B both declare T | The guess `A.T` stays, because the import makes it visible before the qualifier is read | not measured |
+
 ## Fixed in `0.12.1-fleethd.1`
 
 - **Concurrent requests on one MCP server ran one at a time.** 16 concurrent requests to one server took 6.7 s

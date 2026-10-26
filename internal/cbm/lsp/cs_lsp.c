@@ -3391,6 +3391,8 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
  * no fields, so `_service.Method()` stayed untyped. Collect this file's fields against the
  * cross-file registry, inside the file's namespace, and expose them on ctx. */
 static void cs_collect_file_fields(CSLSPContext *ctx, TSNode root, cs_fields_table_t *tab) {
+    /* A field typed by a `using A = N.T;` alias resolves through the alias. */
+    cs_collect_imports(ctx, root);
     TSNode stack[64];
     int top = 0;
     stack[top++] = root;

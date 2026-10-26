@@ -6,7 +6,8 @@ every Claude Code session.
 
 1. **C# type refs become USAGE edges** (`internal/cbm/extract_type_refs.c`). Class-level property and
    field types (with generic arguments, nullables, arrays) and method-body `new T()` / `typeof(T)` /
-   `(T)x` produce `USAGE` edges, so `AlertRuleDto -USAGE-> FaultRuleDto`. `add_type_ref` pushes a
+   `(T)x` produce `USAGE` edges, so `AlertRuleDto -USAGE-> FaultRuleDto`. A qualified generic
+   (`System.Collections.Generic.List<FaultRuleDto>`) also gives its type arguments. `add_type_ref` pushes a
    usage (zero-initialized `CBMUsage`) instead of an unused type ref, for every language. It strips the `: ` of a
    TypeScript annotation and keeps only identifier names (letters, digits, `_`, `.`, `$`), so `() => void` and
    `std::vector` give no usage. Upstream test `repro_call_argument_ts_lsp_cannot_rescue` checks this.
@@ -22,7 +23,8 @@ every Claude Code session.
    `pass_parallel.c`). This applies only to a target that the registry guessed by name, not to an LSP-proven target.
    - A type is visible when its namespace encloses the file's namespace, a `using` imports it, or the reference's
      qualifier reaches it: `Entity.Foo` from inside `FleetHd.X` reaches `FleetHd.X.Entity`, and `A.Gps.Foo` with
-     `using A = FleetHd.Contracts;` reaches `FleetHd.Contracts.Gps`. A bare usage takes its qualifier from the source
+     `using A = FleetHd.Contracts;` reaches `FleetHd.Contracts.Gps`. A namespace alias (`using A = N;`) does not make
+     the bare names of N visible. A bare usage takes its qualifier from the source
      bytes in front of it (`site_start_byte`), because the extractor keeps only the last name. A constructor guess
      counts as its class. When the guess is not visible, the edge goes to the one visible type of that name, or is
      dropped. A call guessed onto a type (`new T()`) is moved the same way (`cbm_pipeline_cs_call_type_qn`).
@@ -46,7 +48,8 @@ every Claude Code session.
 6. **C# calls through a field are typed** (`internal/cbm/lsp/cs_lsp.c`, `cs_collect_file_fields`,
    `cs_member_field_type`). The cross-file C# pass registers types without fields, so `_service.Method()` fell back
    to a name guess. The pass now collects the file's own fields and properties against the cross-file registry. C#
-   calls resolved as `cs_method_typed` went from 3,633 to 14,037.
+   calls resolved as `cs_method_typed` went from 3,633 to 14,037. The file's `using` directives load first, so a field
+   typed by an alias (`using Svc = N.Service; Svc _svc;`) resolves to `N.Service`, not to a class named `Svc`.
 7. **Server instructions state the watcher dependency** (`src/mcp/mcp.c`, `MCP_SERVER_INSTRUCTIONS`). The text
    says that indexes refresh automatically only when `auto_watch` is on. FleetHd runs with the watcher off.
 8. **Read-only tool calls of one session run in parallel** (`src/daemon/frontend.c`,
@@ -67,7 +70,7 @@ Each test below is in upstream's suite and fails when its patch is removed (chec
 
 | Test | Patches |
 |---|---|
-| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 3, 4 (with static receivers), 5, 6 |
+| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3, 4 (with static receivers and namespace aliases), 5, 6 (with alias-typed fields) |
 | `daemon_frontend_pool_runs_read_only_calls_in_parallel` (`tests/test_daemon_frontend.c`) | 8 |
 | `incr_csharp_visibility_matches_full_run` (`tests/test_incremental.c`) | 4 (incremental runs) |
 | `tool_search_graph_bm25_scoped_query_ranks_full_match_set` (`tests/test_mcp.c`) | 2 |
