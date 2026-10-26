@@ -41,6 +41,11 @@ every Claude Code session.
      repo, is a static call: a guessed member of a type not named X (or aliased as X) is dropped
      (`cbm_pipeline_cs_static_receiver_mismatch`). `Assert.True` no longer binds an enum member `True`, nor
      `Math.Max` an entity method. Name-guessed `X.M()` calls went from 3,141 to 442 on the monolith.
+   - When the C# pass typed the receiver to a type that has no type node in the graph (`ILogger`, `List<T>`), a
+     name guess is dropped (`cbm_pipeline_cs_external_guess`). An extension method on that type in the caller's
+     repo stays (`this ILogger` in `fleet-hd-mobile`). This removed 916 C# `CALLS` edges on the monolith
+     (2026-10-26), for example `rows.Add` -> `AssetAttributesWorker.Add`, `double.Parse` -> `AddressParser.Parse`,
+     and 410 edges to the `fleet-hd-mobile-kiosk` logger extensions from repos that do not reference that project.
    - The check uses a map from file to declared namespace. An incremental run extracts only changed files, so
      `cbm_pipeline_cs_ns_add_unchanged` (called from `pipeline_incremental.c`) reads the first `namespace` line of
      every other `.cs` file. `CBM_FLEETHD_NO_CS_VISIBILITY=1` turns the check off.
@@ -76,11 +81,15 @@ Each test below is in upstream's suite and fails when its patch is removed (chec
 
 | Test | Patches |
 |---|---|
-| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3 (with base types), 4 (with static receivers and namespace aliases), 5, 6 (with alias-typed fields) |
+| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3 (with base types), 4 (with static receivers, namespace aliases and external receivers), 5, 6 (with alias-typed fields) |
 | `daemon_frontend_pool_runs_read_only_calls_in_parallel` (`tests/test_daemon_frontend.c`) | 8 |
 | `incr_csharp_visibility_matches_full_run` (`tests/test_incremental.c`) | 4 (incremental runs) |
 | `tool_search_graph_bm25_scoped_query_ranks_full_match_set` (`tests/test_mcp.c`) | 2 |
 | `repro_call_argument_ts_lsp_cannot_rescue` (upstream test) | 1 (TypeScript annotations) |
+
+The same-repo extension exception of the external-receiver rule (patch 4) has no failing test. The C# pass resolves
+the fixture's extension calls itself, so they never reach the name guess. On the monolith the exception keeps 214
+edges (2026-10-26); measure it again with an edge diff after a change to that rule.
 
 ## Not carried
 

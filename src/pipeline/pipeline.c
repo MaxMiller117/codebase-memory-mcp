@@ -1214,6 +1214,107 @@ const cbm_gbuf_node_t *cbm_pipeline_cs_base_node(const cbm_registry_t *r, const 
                                           repo_path, 0);
 }
 
+/* The simple name of the receiver type of a C# row that names one, when no type of that name is
+ * in the graph (`ILogger`, `List`). Rows: `cs_method_typed[_unindexed]`, `cs_method_inherited`,
+ * `cs_static_typed[_unindexed]`; a stdlib method (`List.Add`) comes as `cs_method_typed`. */
+static bool cs_external_receiver_type(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                      const CBMResolvedCall *lsp, char *simple_out,
+                                      size_t simple_size) {
+    if (!g_file_nsmap || !lsp || !lsp->strategy || !lsp->callee_qn ||
+        (strncmp(lsp->strategy, "cs_method_typed", 15) != 0 &&
+         strcmp(lsp->strategy, "cs_method_inherited") != 0 &&
+         strncmp(lsp->strategy, "cs_static_typed", 15) != 0)) {
+        return false;
+    }
+    char type_qn[CBM_SZ_512];
+    size_t n = strcspn(lsp->callee_qn, "<");
+    const char *dot = strrchr(lsp->callee_qn, '.');
+    if (dot && (size_t)(dot - lsp->callee_qn) < n) {
+        n = (size_t)(dot - lsp->callee_qn); /* drop `.Method` */
+    }
+    if (n == 0 || n >= sizeof(type_qn)) {
+        return false;
+    }
+    memcpy(type_qn, lsp->callee_qn, n);
+    type_qn[n] = '\0';
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gb, type_qn);
+    if (node && cbm_label_is_type_like(node->label)) {
+        return false;
+    }
+    const char *simple = strrchr(type_qn, '.');
+    simple = simple ? simple + 1 : type_qn;
+    const char **qns = NULL;
+    int count = 0;
+    if (cbm_registry_find_by_name(r, simple, &qns, &count) == 0) {
+        for (int i = 0; i < count; i++) {
+            const cbm_gbuf_node_t *t = cbm_gbuf_find_by_qn(gb, qns[i]);
+            if (t && cbm_label_is_type_like(t->label)) {
+                return false; /* a project type: its method may be inherited or unseen */
+            }
+        }
+    }
+    snprintf(simple_out, simple_size, "%s", simple);
+    return true;
+}
+
+/* Skip blanks, JSON-escaped line breaks and `#pragma` lines in a stored signature. */
+static const char *cs_sig_skip(const char *p) {
+    for (;;) {
+        if (*p == ' ' || *p == '\t') {
+            p++;
+        } else if (p[0] == '\\' && (p[1] == 'r' || p[1] == 'n' || p[1] == 't')) {
+            p += 2;
+        } else if (*p == '#') {
+            while (*p && *p != '"' && !(p[0] == '\\' && p[1] == 'n')) {
+                p++;
+            }
+        } else {
+            return p;
+        }
+    }
+}
+
+/* True when `node` is an extension method whose `this` parameter has the type `simple`. */
+static bool cs_extension_of(const cbm_gbuf_node_t *node, const char *simple) {
+    const char *p = node->properties_json ? strstr(node->properties_json, "\"signature\":\"(")
+                                          : NULL;
+    if (!p) {
+        return false;
+    }
+    p = cs_sig_skip(p + 14);
+    if (strncmp(p, "this", 4) != 0) {
+        return false;
+    }
+    const char *t = cs_sig_skip(p + 4);
+    if (t == p + 4) {
+        return false; /* `thisValue`, not the `this` modifier */
+    }
+    const char *start = t;
+    while (isalnum((unsigned char)*t) || *t == '_' || *t == '.') {
+        t++;
+    }
+    const char *last = start;
+    for (const char *q = start; q < t; q++) {
+        if (*q == '.') {
+            last = q + 1;
+        }
+    }
+    size_t len = (size_t)(t - last);
+    return len == strlen(simple) && strncmp(last, simple, len) == 0;
+}
+
+bool cbm_pipeline_cs_external_guess(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                    const char *caller_rel, const CBMResolvedCall *lsp,
+                                    const char *guess_qn) {
+    char simple[CBM_SZ_256];
+    if (!guess_qn || !guess_qn[0] ||
+        !cs_external_receiver_type(r, gb, lsp, simple, sizeof(simple))) {
+        return false;
+    }
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gb, guess_qn);
+    return node && !(cs_same_repo(caller_rel, node->file_path) && cs_extension_of(node, simple));
+}
+
 bool cbm_pipeline_cs_static_receiver_mismatch(const cbm_registry_t *r, const cbm_gbuf_t *gb,
                                               const CBMFileResult *caller, const char *caller_rel,
                                               const char *callee_name, const char *qn) {

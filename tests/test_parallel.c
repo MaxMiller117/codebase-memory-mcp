@@ -2975,6 +2975,25 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     static const char derived[] = "using RepoH.Data;\nnamespace RepoC;\n"
                                   "public class VehicleRepo : RepoBase<int> {\n"
                                   "    public VehicleRepo() : base(1) { }\n}\n";
+    /* A receiver typed to a framework type binds no same-named project method. */
+    static const char log_user[] = "using System.Collections.Generic;\n"
+                                   "using Microsoft.Extensions.Logging;\nnamespace RepoC;\n"
+                                   "public class LogUser {\n    private ILogger _logger;\n"
+                                   "    private List<int> _items;\n"
+                                   "    public void Go() { _logger.LogError(\"x\"); _items.Add(1); }\n"
+                                   "    public void Audit() { _logger.LogAudit(true, \"x\"); }\n}\n";
+    /* The same logger extension in two repos, in the fleet-hd-mobile form: the caller's own
+     * copy binds, the other repo's copy does not. */
+    static const char log_ext[] = "#if ANDROID\nusing Android.OS;\n#elif IOS\nusing Foundation;\n#endif\n"
+                                  "using Serilog;\n"
+                                  "namespace Microsoft.Extensions.Logging;\n"
+                                  "public static partial class LogExt {\n"
+                                  "    public static void LogAudit(\n"
+                                  "#pragma warning disable IDE0060\n"
+                                  "        this ILogger logger, bool decorate, string m) { }\n}\n";
+    static const char audit[] = "namespace RepoC;\npublic class Audit {\n"
+                                "    public void LogError(string m) { }\n"
+                                "    public void Add(int x) { }\n}\n";
     static const char *rels[] = {
         "repoA/src/VehicleDto.cs",    "repoB/src/VehicleDto.cs",  "repoC/src/User.cs",
         "repoC/src/AliasUser.cs",     "repoC/src/Guarded.cs",     "repoD/src/Results.cs",
@@ -2982,13 +3001,14 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         "aaaRepo/src/AaaController.cs", "repoC/src/ControllerTests.cs", "repoC/src/Flags.cs",
         "repoC/src/NsAliasUser.cs",   "repoC/src/Holder.cs",      "repoE/src/Service.cs",
         "repoF/src/SvcAlias.cs",      "repoC/src/AliasField.cs",  "repoG/src/RepoBase.cs",
-        "repoH/src/RepoBase.cs",      "repoC/src/VehicleRepo.cs",
+        "repoH/src/RepoBase.cs",      "repoC/src/VehicleRepo.cs", "repoC/src/LogUser.cs",
+        "repoC/src/Audit.cs",         "repoC/src/LogExt.cs",      "repoF/src/LogExt.cs",
     };
     const char *srcs[] = {a_dto,    b_dto,      user,    alias_user, guarded,  results,
                           controller, regular,  other,   tests,      flags,    ns_alias,
                           holder,   good_svc,   svc_decoy, alias_field, base_g, base_h,
-                          derived};
-    enum { N_FILES = 19, N_CHECKS = 19 };
+                          derived,  log_user,   audit,   log_ext,  log_ext};
+    enum { N_FILES = 23, N_CHECKS = 23 };
     const char *project = "cbm_fleethd_cs";
 
     char tmpdir[256];
@@ -3030,6 +3050,10 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     const char *vehicle_repo = "cbm_fleethd_cs.repoC.src.VehicleRepo.VehicleRepo";
     const char *base_h_class = "cbm_fleethd_cs.repoH.src.RepoBase.RepoBase";
     const char *base_g_class = "cbm_fleethd_cs.repoG.src.RepoBase.RepoBase";
+    const char *audit_log = "cbm_fleethd_cs.repoC.src.Audit.Audit.LogError";
+    const char *audit_add = "cbm_fleethd_cs.repoC.src.Audit.Audit.Add";
+    const char *log_audit = "cbm_fleethd_cs.repoC.src.LogExt.LogExt.LogAudit";
+    const char *far_audit = "cbm_fleethd_cs.repoF.src.LogExt.LogExt.LogAudit";
     bool ok[2][N_CHECKS];
     bool all = true;
     for (int g = 0; g < 2; g++) {
@@ -3056,6 +3080,13 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         ok[g][17] = has_edge_qn_to_qn(gb, vehicle_repo, base_h_class, "INHERITS");
         ok[g][18] = cbm_gbuf_find_by_qn(gb, vehicle_repo) &&
                     !has_edge_qn_to_qn(gb, vehicle_repo, base_g_class, "INHERITS");
+        ok[g][19] = find_unique_callable_node_by_tail(gb, "LogUser.Go") &&
+                    !has_edge_from_callable_to_qn(gb, "LogUser.Go", audit_log, "CALLS");
+        ok[g][20] = find_unique_callable_node_by_tail(gb, "LogUser.Go") &&
+                    !has_edge_from_callable_to_qn(gb, "LogUser.Go", audit_add, "CALLS");
+        ok[g][21] = has_edge_from_callable_to_qn(gb, "LogUser.Audit", log_audit, "CALLS");
+        ok[g][22] = find_unique_callable_node_by_tail(gb, "LogUser.Audit") &&
+                    !has_edge_from_callable_to_qn(gb, "LogUser.Audit", far_audit, "CALLS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
         }
@@ -3064,11 +3095,12 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         for (int g = 0; g < 2; g++) {
             printf("  C# FleetHd diagnostic %s: using=%d/%d ctor=%d alias=%d/%d if_using=%d "
                    "framework_call=%d field_call=%d/%d static_receiver=%d/%d ns_alias=%d/%d "
-                   "qualified_generic=%d/%d alias_field=%d/%d base_with_ctor=%d/%d\n",
+                   "qualified_generic=%d/%d alias_field=%d/%d base_with_ctor=%d/%d "
+                   "external_receiver=%d/%d own_extension=%d/%d\n",
                    g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
                    ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10],
                    ok[g][11], ok[g][12], ok[g][13], ok[g][14], ok[g][15], ok[g][16], ok[g][17],
-                   ok[g][18]);
+                   ok[g][18], ok[g][19], ok[g][20], ok[g][21], ok[g][22]);
         }
     }
     cbm_gbuf_free(graphs[0]);

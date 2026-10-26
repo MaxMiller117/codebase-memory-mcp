@@ -3450,8 +3450,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              (!cbm_pipeline_cs_qn_visible(rc->main_gbuf, rc->project_name, result, rel,
                                           res.qualified_name, call->callee_name) ||
               cbm_pipeline_cs_static_receiver_mismatch(rc->registry, rc->main_gbuf, result, rel,
-                                                       call->callee_name,
-                                                       res.qualified_name)));
+                                                       call->callee_name, res.qualified_name) ||
+              cbm_pipeline_cs_external_guess(rc->registry, rc->main_gbuf, rel, lsp,
+                                             res.qualified_name)));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve

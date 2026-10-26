@@ -89,6 +89,6 @@ Runs started 2026-10-26 15:32:38 and 2026-10-26 15:35:55.
 | burst 1 median_ms | 3,670 | 737 | -80% |
 | burst 2 wall_ms | 6,180 | 1,438 | -77% |
 | burst 2 median_ms | 3,612 | 723 | -80% |
-| first call | 74 | 1,553 |  |
+| first call (`list_projects`; see KNOWN_ISSUES 7) | 74 | 1,553 |  |
 | server peak working set (MB) | 2,951 | 232 | -92% |
 

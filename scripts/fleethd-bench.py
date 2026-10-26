@@ -252,9 +252,11 @@ def cmd_run(a):
     if not result["schema"]["edge_types"]:
         print(f"WARN: no edge types parsed from get_graph_schema: {schema_out[:200]!r}", flush=True)
 
-    srv = Server(exe, env)
-    _, first_ms = srv.tool("list_projects", {})
-    result["first_call_ms"] = round(first_ms)
+    t0 = time.perf_counter()
+    srv = Server(exe, env)  # no daemon runs for this cache yet: a cold start
+    result["first_call_ms"] = round((time.perf_counter() - t0) * 1000)
+    _, list_ms = srv.tool("list_projects", {})
+    result["list_projects_ms"] = round(list_ms)
 
     probes = {}
     for name, kind, q, judge in PROBES:
@@ -364,7 +366,8 @@ def cmd_compare(a):
     table("16 concurrent requests on one server (ms)",
           [[f"burst {i + 1} {m}", fmt(ba[i][m]), fmt(bb[i][m]), delta(ba[i][m], bb[i][m])]
            for i in range(2) for m in ("wall_ms", "median_ms")] +
-          [["first call", fmt(A["first_call_ms"]), fmt(B["first_call_ms"]), ""],
+          [["initialize, cold daemon", fmt(A["first_call_ms"]), fmt(B["first_call_ms"]), ""],
+           ["list_projects", fmt(A.get("list_projects_ms")), fmt(B.get("list_projects_ms")), ""],
            ["server peak working set (MB)", fmt(A["server_rss_mb"]), fmt(B["server_rss_mb"]),
             delta(A["server_rss_mb"], B["server_rss_mb"])]])
     text = "\n".join(lines)

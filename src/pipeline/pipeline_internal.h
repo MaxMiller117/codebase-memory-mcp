@@ -826,6 +826,13 @@ const cbm_gbuf_node_t *cbm_pipeline_cs_base_node(const cbm_registry_t *r, const 
                                                  const char **imp_vals, int imp_count,
                                                  const char *repo_path);
 
+/* FleetHd local patch: true when the name guess `guess_qn` must be dropped because the C# pass
+ * typed the receiver (row `lsp`) to a type with no type node in the graph (`ILogger`, `List<T>`).
+ * An extension method on that type in the caller's repo stays. */
+bool cbm_pipeline_cs_external_guess(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                    const char *caller_rel, const CBMResolvedCall *lsp,
+                                    const char *guess_qn);
+
 /* FleetHd local patch: true for a usage source that is the file itself, not a symbol. */
 static inline bool cbm_pipeline_node_is_file_scope(const cbm_gbuf_node_t *node) {
     return node && node->label &&

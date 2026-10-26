@@ -1187,7 +1187,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
          (!cbm_pipeline_cs_qn_visible(ctx->gbuf, ctx->project_name, result, rel,
                                       res.qualified_name, call->callee_name) ||
           cbm_pipeline_cs_static_receiver_mismatch(ctx->registry, ctx->gbuf, result, rel,
-                                                   call->callee_name, res.qualified_name)));
+                                                   call->callee_name, res.qualified_name) ||
+          cbm_pipeline_cs_external_guess(ctx->registry, ctx->gbuf, rel, lsp,
+                                         res.qualified_name)));
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library

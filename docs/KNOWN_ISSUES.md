@@ -57,8 +57,9 @@ target's type, so a guess inside the caller's repo can stay and name the wrong c
 | field `_f.M()` | 1,050 | framework types (`ILogger.LogError`) bind a project method |
 | static `X.M()` | 442 | X is a property in the repo |
 
-**Possible fix:** when the C# pass typed the receiver to a type outside the project (an `ILogger`, a `List<T>`),
-do not fall back to a name guess.
+**Partly fixed (2026-10-26):** when the C# pass typed the receiver to a type with no type node in the graph (an
+`ILogger`, a `List<T>`), the name guess is dropped (local patch 4). This removed 916 edges. A receiver that the pass
+cannot type at all (a `var` from an unregistered method) still falls back to a name guess.
 
 ## 5. Some qualified type references still lose their edge
 
@@ -76,11 +77,16 @@ Local patch 4 does not model these C# forms. Each count below is from the main c
 | `namespace` alone on a line, or after `*/` on the same line | An incremental run does not read the namespace of an unchanged file | 0 files |
 | `using A;` plus an explicit `B.T` where A and B both declare T | The guess `A.T` stays, because the import makes it visible before the qualifier is read | not measured |
 
-## 7. The first call on a cold daemon is slower
+## 7. `list_projects` takes 1.5 s per call
 
-With no daemon running for the cache, the first MCP call (`list_projects`) took 1,553 ms on `0.12.1-fleethd.1`,
-against 74 ms on `0.11.0-fleethd.2` (`docs/BENCHMARKS.md`, 2026-10-26). The cause is not measured. A session that
-starts while another session holds the daemon does not start a new daemon.
+On `0.12.1-fleethd.1`, every `list_projects` call takes about 1,500 ms, against 60–75 ms on `0.11.0-fleethd.2`. The
+first call and later calls take the same time, and stock upstream `10ab613d` takes the same time, so the cost is
+upstream's (measured 2026-10-26). Other tools answer in 15–30 ms (`search_graph` by name). A cold start is faster:
+`initialize` took 750 ms, against 3,400 ms on the old build.
+
+The cause is not found. `metadata_only=true`, which skips the git branch lookup, takes the same time, and SQLite
+opens the index and reads its `projects` row in less than 1 ms. The FleetHd hooks do not call the binary, so only an
+agent that calls `list_projects` waits.
 
 ## Fixed in `0.12.1-fleethd.1`
 
