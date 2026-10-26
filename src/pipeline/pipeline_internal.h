@@ -833,6 +833,12 @@ bool cbm_pipeline_cs_external_guess(const cbm_registry_t *r, const cbm_gbuf_t *g
                                     const char *caller_rel, const CBMResolvedCall *lsp,
                                     const char *guess_qn);
 
+/* FleetHd local patch: true when the C# name guess `guess_qn` of a call is a field or variable
+ * that is not a delegate (an enum member, a constant, a plain property), read from its
+ * declaration under `repo_path`. A field in the caller's own file stays. */
+bool cbm_pipeline_cs_noncallable_guess(const cbm_gbuf_t *gb, const char *caller_rel,
+                                       const char *repo_path, const char *guess_qn);
+
 /* FleetHd local patch: true for a usage source that is the file itself, not a symbol. */
 static inline bool cbm_pipeline_node_is_file_scope(const cbm_gbuf_node_t *node) {
     return node && node->label &&

@@ -2991,6 +2991,13 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
                                   "    public static void LogAudit(\n"
                                   "#pragma warning disable IDE0060\n"
                                   "        this ILogger logger, bool decorate, string m) { }\n}\n";
+    /* A call guessed onto a field binds it only when the field is a delegate. */
+    static const char agg[] = "namespace RepoD.Metrics;\npublic enum AggKind { Average = 1 }\n"
+                              "public class Fence {\n"
+                              "    public System.Func<bool> StillOwned { get; set; }\n}\n";
+    static const char stats[] = "using RepoD.Metrics;\nnamespace RepoC;\npublic class Stats {\n"
+                                "    public double Run(dynamic values) { return values.Average(); }\n"
+                                "    public bool Check(dynamic f) { return f.StillOwned(); }\n}\n";
     static const char audit[] = "namespace RepoC;\npublic class Audit {\n"
                                 "    public void LogError(string m) { }\n"
                                 "    public void Add(int x) { }\n}\n";
@@ -3003,12 +3010,14 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         "repoF/src/SvcAlias.cs",      "repoC/src/AliasField.cs",  "repoG/src/RepoBase.cs",
         "repoH/src/RepoBase.cs",      "repoC/src/VehicleRepo.cs", "repoC/src/LogUser.cs",
         "repoC/src/Audit.cs",         "repoC/src/LogExt.cs",      "repoF/src/LogExt.cs",
+        "repoD/src/Metrics.cs",       "repoC/src/Stats.cs",
     };
     const char *srcs[] = {a_dto,    b_dto,      user,    alias_user, guarded,  results,
                           controller, regular,  other,   tests,      flags,    ns_alias,
                           holder,   good_svc,   svc_decoy, alias_field, base_g, base_h,
-                          derived,  log_user,   audit,   log_ext,  log_ext};
-    enum { N_FILES = 23, N_CHECKS = 23 };
+                          derived,  log_user,   audit,   log_ext,  log_ext,  agg,
+                          stats};
+    enum { N_FILES = 25, N_CHECKS = 25 };
     const char *project = "cbm_fleethd_cs";
 
     char tmpdir[256];
@@ -3054,6 +3063,8 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     const char *audit_add = "cbm_fleethd_cs.repoC.src.Audit.Audit.Add";
     const char *log_audit = "cbm_fleethd_cs.repoC.src.LogExt.LogExt.LogAudit";
     const char *far_audit = "cbm_fleethd_cs.repoF.src.LogExt.LogExt.LogAudit";
+    const char *agg_average = "cbm_fleethd_cs.repoD.src.Metrics.AggKind.Average";
+    const char *fence_owned = "cbm_fleethd_cs.repoD.src.Metrics.Fence.StillOwned";
     bool ok[2][N_CHECKS];
     bool all = true;
     for (int g = 0; g < 2; g++) {
@@ -3087,6 +3098,9 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         ok[g][21] = has_edge_from_callable_to_qn(gb, "LogUser.Audit", log_audit, "CALLS");
         ok[g][22] = find_unique_callable_node_by_tail(gb, "LogUser.Audit") &&
                     !has_edge_from_callable_to_qn(gb, "LogUser.Audit", far_audit, "CALLS");
+        ok[g][23] = find_unique_callable_node_by_tail(gb, "Stats.Run") &&
+                    !has_edge_from_callable_to_qn(gb, "Stats.Run", agg_average, "CALLS");
+        ok[g][24] = has_edge_from_callable_to_qn(gb, "Stats.Check", fence_owned, "CALLS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
         }
@@ -3096,11 +3110,12 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
             printf("  C# FleetHd diagnostic %s: using=%d/%d ctor=%d alias=%d/%d if_using=%d "
                    "framework_call=%d field_call=%d/%d static_receiver=%d/%d ns_alias=%d/%d "
                    "qualified_generic=%d/%d alias_field=%d/%d base_with_ctor=%d/%d "
-                   "external_receiver=%d/%d own_extension=%d/%d\n",
+                   "external_receiver=%d/%d own_extension=%d/%d field_guess=%d/%d\n",
                    g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
                    ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10],
                    ok[g][11], ok[g][12], ok[g][13], ok[g][14], ok[g][15], ok[g][16], ok[g][17],
-                   ok[g][18], ok[g][19], ok[g][20], ok[g][21], ok[g][22]);
+                   ok[g][18], ok[g][19], ok[g][20], ok[g][21], ok[g][22], ok[g][23],
+                   ok[g][24]);
         }
     }
     cbm_gbuf_free(graphs[0]);

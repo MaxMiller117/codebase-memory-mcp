@@ -1315,6 +1315,48 @@ bool cbm_pipeline_cs_external_guess(const cbm_registry_t *r, const cbm_gbuf_t *g
     return node && !(cs_same_repo(caller_rel, node->file_path) && cs_extension_of(node, simple));
 }
 
+/* True when the declaration of `node` (its source lines) names a delegate type or an event. */
+static bool cs_declares_delegate(const cbm_gbuf_node_t *node, const char *repo_path) {
+    static const char *const marks[] = {"Func<", "Action", "Predicate<", "EventHandler",
+                                        "Delegate", "delegate ", "event "};
+    char path[CBM_SZ_2K];
+    snprintf(path, sizeof(path), "%s/%s", repo_path, node->file_path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return true; /* unreadable: keep the edge */
+    }
+    char line[CBM_SZ_1K];
+    bool found = false;
+    int last = node->end_line >= node->start_line ? node->end_line : node->start_line;
+    int n = 1; /* line number of the chunk in `line`; a long line comes in several chunks */
+    while (!found && n <= last && fgets(line, sizeof(line), f)) {
+        if (n >= node->start_line) {
+            for (size_t i = 0; !found && i < sizeof(marks) / sizeof(marks[0]); i++) {
+                found = strstr(line, marks[i]) != NULL;
+            }
+        }
+        if (strchr(line, '\n')) {
+            n++;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+bool cbm_pipeline_cs_noncallable_guess(const cbm_gbuf_t *gb, const char *caller_rel,
+                                       const char *repo_path, const char *guess_qn) {
+    const cbm_gbuf_node_t *node =
+        g_file_nsmap && guess_qn && guess_qn[0] ? cbm_gbuf_find_by_qn(gb, guess_qn) : NULL;
+    if (!node || !node->label || !node->file_path || !repo_path ||
+        (strcmp(node->label, "Field") != 0 && strcmp(node->label, "Variable") != 0)) {
+        return false;
+    }
+    if (caller_rel && strcmp(caller_rel, node->file_path) == 0) {
+        return false; /* the caller's own field: it compiles only as a delegate */
+    }
+    return !cs_declares_delegate(node, repo_path);
+}
+
 bool cbm_pipeline_cs_static_receiver_mismatch(const cbm_registry_t *r, const cbm_gbuf_t *gb,
                                               const CBMFileResult *caller, const char *caller_rel,
                                               const char *callee_name, const char *qn) {

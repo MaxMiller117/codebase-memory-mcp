@@ -58,8 +58,16 @@ target's type, so a guess inside the caller's repo can stay and name the wrong c
 | static `X.M()` | 442 | X is a property in the repo |
 
 **Partly fixed (2026-10-26):** when the C# pass typed the receiver to a type with no type node in the graph (an
-`ILogger`, a `List<T>`), the name guess is dropped (local patch 4). This removed 916 edges. A receiver that the pass
-cannot type at all (a `var` from an unregistered method) still falls back to a name guess.
+`ILogger`, a `List<T>`), the name guess is dropped (local patch 4). This removed 916 edges. A guess onto a field
+that is not a delegate is dropped too (798 edges). A receiver that the pass cannot type at all (a `var` from an
+unregistered method) still falls back to a name guess.
+
+**Precision of the guesses that remain:** a sample of 50 name-guess `CALLS` edges (2026-10-26, before the field
+rule) had 44 correct, 6 wrong and 1 uncertain. The 44 correct were mostly constructor calls and calls through
+variables of project types. The wrong ones were LINQ or collection methods on a receiver that the pass could not
+type (`entities.Max`, `MapView.Pins.Remove`), a mock setup lambda (`x.GetByVinAsync`), and two `new DateTime()`
+calls bound to a field, which the field rule now drops. Check the target's class before you follow a guessed call
+(`strategy` is not `cs_*` or `lsp_*`).
 
 ## 5. Some qualified type references still lose their edge
 

@@ -46,6 +46,11 @@ every Claude Code session.
      repo stays (`this ILogger` in `fleet-hd-mobile`). This removed 916 C# `CALLS` edges on the monolith
      (2026-10-26), for example `rows.Add` -> `AssetAttributesWorker.Add`, `double.Parse` -> `AddressParser.Parse`,
      and 410 edges to the `fleet-hd-mobile-kiosk` logger extensions from repos that do not reference that project.
+   - A call guessed onto a field or variable is dropped unless its declaration names a delegate type (`Func`,
+     `Action`, `Predicate`, `EventHandler`, `Delegate`, `delegate`) or an event, or the field is in the caller's own
+     file (`cbm_pipeline_cs_noncallable_guess`). C# compiles a call to a field only when the field is a delegate.
+     This removed 798 C# `CALLS` edges on the monolith (2026-10-26), for example `List` -> an enum member `List`,
+     `.Replace` -> an enum member `Replace`, `new DateTime()` -> a field `DateTime`; 142 delegate calls stay.
    - The check uses a map from file to declared namespace. An incremental run extracts only changed files, so
      `cbm_pipeline_cs_ns_add_unchanged` (called from `pipeline_incremental.c`) reads the first `namespace` line of
      every other `.cs` file. `CBM_FLEETHD_NO_CS_VISIBILITY=1` turns the check off.
@@ -81,7 +86,7 @@ Each test below is in upstream's suite and fails when its patch is removed (chec
 
 | Test | Patches |
 |---|---|
-| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3 (with base types), 4 (with static receivers, namespace aliases and external receivers), 5, 6 (with alias-typed fields) |
+| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3 (with base types), 4 (with static receivers, namespace aliases, external receivers and field targets), 5, 6 (with alias-typed fields) |
 | `daemon_frontend_pool_runs_read_only_calls_in_parallel` (`tests/test_daemon_frontend.c`) | 8 |
 | `incr_csharp_visibility_matches_full_run` (`tests/test_incremental.c`) | 4 (incremental runs) |
 | `tool_search_graph_bm25_scoped_query_ranks_full_match_set` (`tests/test_mcp.c`) | 2 |
