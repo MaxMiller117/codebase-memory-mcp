@@ -18,6 +18,12 @@ every Claude Code session.
    `cbm_pipeline_cs_ctor_owner`, called from `pass_usages.c` and `pass_parallel.c`). Upstream's registry tie-break
    prefers a callable, so a type reference `Foo` went to the constructor `Foo.Foo`. Without this patch, at least
    8,081 `USAGE` edges went to constructors of 178 classes, and `(Class)<-[:USAGE]-` queries missed them.
+   A C# base type resolves the same way (`cbm_pipeline_cs_base_node`, called from `pass_semantic.c` and
+   `pass_parallel.c`): upstream resolved `: RepoBase<T>` to the constructor `RepoBase.RepoBase`, rejected it as not a
+   type, and made no edge. Without this patch, `INHERITS` edges on the monolith went from 3,197 (`0.11.0-fleethd.2`)
+   to 1,791 (2026-10-26). Every base class with an explicit constructor lost its edges (`OrderedQueryRepository`,
+   `CommandRepositoryBase`, `IntegrationTestBase`).
+   The base type must also be visible from the file (patch 4).
 4. **A C# name guess must be visible from the referencing file** (`src/pipeline/pipeline.c`,
    `cbm_pipeline_cs_visible_target` / `cbm_pipeline_cs_qn_visible`, called from `pass_usages.c`, `pass_calls.c` and
    `pass_parallel.c`). This applies only to a target that the registry guessed by name, not to an LSP-proven target.
@@ -70,7 +76,7 @@ Each test below is in upstream's suite and fails when its patch is removed (chec
 
 | Test | Patches |
 |---|---|
-| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3, 4 (with static receivers and namespace aliases), 5, 6 (with alias-typed fields) |
+| `parallel_csharp_fleethd_visibility_patches` (`tests/test_parallel.c`, sequential and parallel runs) | 1 (qualified generics), 3 (with base types), 4 (with static receivers and namespace aliases), 5, 6 (with alias-typed fields) |
 | `daemon_frontend_pool_runs_read_only_calls_in_parallel` (`tests/test_daemon_frontend.c`) | 8 |
 | `incr_csharp_visibility_matches_full_run` (`tests/test_incremental.c`) | 4 (incremental runs) |
 | `tool_search_graph_bm25_scoped_query_ranks_full_match_set` (`tests/test_mcp.c`) | 2 |

@@ -817,6 +817,15 @@ const cbm_gbuf_node_t *cbm_pipeline_cs_visible_target(const cbm_registry_t *r,
                                                       const char *repo_path,
                                                       uint32_t site_start);
 
+/* FleetHd local patch: the node of the C# base type `base_name` of a class in `caller`, or
+ * NULL. A constructor resolves to its class, and the type must be visible from the file. */
+const cbm_gbuf_node_t *cbm_pipeline_cs_base_node(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                                 const char *project, const CBMFileResult *caller,
+                                                 const char *caller_rel, const char *base_name,
+                                                 const char *module_qn, const char **imp_keys,
+                                                 const char **imp_vals, int imp_count,
+                                                 const char *repo_path);
+
 /* FleetHd local patch: true for a usage source that is the file itself, not a symbol. */
 static inline bool cbm_pipeline_node_is_file_scope(const cbm_gbuf_node_t *node) {
     return node && node->label &&

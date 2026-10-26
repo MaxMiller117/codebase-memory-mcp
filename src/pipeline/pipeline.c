@@ -23,6 +23,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pass_ensemble_routing.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
@@ -1185,6 +1186,32 @@ const cbm_gbuf_node_t *cbm_pipeline_cs_visible_target(const cbm_registry_t *r,
         found = node;
     }
     return found;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_cs_base_node(const cbm_registry_t *r, const cbm_gbuf_t *gb,
+                                                 const char *project, const CBMFileResult *caller,
+                                                 const char *caller_rel, const char *base_name,
+                                                 const char *module_qn, const char **imp_keys,
+                                                 const char **imp_vals, int imp_count,
+                                                 const char *repo_path) {
+    char name[CBM_SZ_512];
+    size_t n = base_name ? strcspn(base_name, "<") : 0;
+    if (n == 0 || n >= sizeof(name)) {
+        return NULL;
+    }
+    memcpy(name, base_name, n);
+    name[n] = '\0';
+    cbm_resolution_t res = cbm_registry_resolve_lang(r, name, module_qn, imp_keys, imp_vals,
+                                                     imp_count, CBM_LANG_CSHARP);
+    const cbm_gbuf_node_t *node = res.qualified_name && res.qualified_name[0]
+                                      ? cbm_gbuf_find_by_qn(gb, res.qualified_name)
+                                      : NULL;
+    node = cbm_pipeline_cs_ctor_owner(gb, node);
+    if (!node || !cbm_label_is_type_like(node->label)) {
+        return NULL;
+    }
+    return cbm_pipeline_cs_visible_target(r, gb, project, caller, caller_rel, node, name, false,
+                                          repo_path, 0);
 }
 
 bool cbm_pipeline_cs_static_receiver_mismatch(const cbm_registry_t *r, const cbm_gbuf_t *gb,

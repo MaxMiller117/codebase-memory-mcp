@@ -3934,6 +3934,7 @@ typedef struct {
     const CBMImportArray *imports;
     const char *rel;
     CBMLanguage lang;
+    const CBMFileResult *result;
 } pp_file_scope_t;
 
 /* Resolve base_classes → INHERITS edges for one definition. */
@@ -3956,7 +3957,15 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
          * the class body first (no external-base gate), then the registry. */
         const char *bqn = cbm_registry_resolve_python_class_body_base(
             rc->registry, rc->main_gbuf, def->qualified_name, def->base_classes[b], fs->lang);
-        if (!bqn) {
+        if (!bqn && fs->lang == CBM_LANG_CSHARP) {
+            const cbm_gbuf_node_t *cs = cbm_pipeline_cs_base_node(
+                rc->registry, rc->main_gbuf, rc->project_name, fs->result, fs->rel,
+                def->base_classes[b], mq, ik, iv, ic, rc->repo_path);
+            if (!cs) {
+                continue;
+            }
+            bqn = cs->qualified_name;
+        } else if (!bqn) {
             bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
             if (!bqn || cbm_python_external_base_contradicts(
                             fs->lang, fs->imports, def->base_classes[b], bqn, rc->main_gbuf,
@@ -4053,7 +4062,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                   const char *module_qn, const char **imp_keys,
                                   const char **imp_vals, int imp_count,
                                   const cbm_php_vendor_names_t *php_vendor) {
-    const pp_file_scope_t fs = {&result->imports, rel, lang};
+    const pp_file_scope_t fs = {&result->imports, rel, lang, result};
     for (int d = 0; d < result->defs.count; d++) {
         CBMDefinition *def = &result->defs.items[d];
         if (!def->qualified_name) {

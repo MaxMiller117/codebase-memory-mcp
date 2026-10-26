@@ -76,6 +76,12 @@ Local patch 4 does not model these C# forms. Each count below is from the main c
 | `namespace` alone on a line, or after `*/` on the same line | An incremental run does not read the namespace of an unchanged file | 0 files |
 | `using A;` plus an explicit `B.T` where A and B both declare T | The guess `A.T` stays, because the import makes it visible before the qualifier is read | not measured |
 
+## 7. The first call on a cold daemon is slower
+
+With no daemon running for the cache, the first MCP call (`list_projects`) took 1,553 ms on `0.12.1-fleethd.1`,
+against 74 ms on `0.11.0-fleethd.2` (`docs/BENCHMARKS.md`, 2026-10-26). The cause is not measured. A session that
+starts while another session holds the daemon does not start a new daemon.
+
 ## Fixed in `0.12.1-fleethd.1`
 
 - **Concurrent requests on one MCP server ran one at a time.** 16 concurrent requests to one server took 6.7 s

@@ -91,4 +91,26 @@ Then update the pinned tag in the plugin README with a PR on `fleet-hd-claude` (
 
    To measure what a resolver change removes or adds, index a second copy with the change off (for patch 4,
    `CBM_FLEETHD_NO_CS_VISIBILITY=1`) and diff the `edges` tables of the two databases.
-4. Merge the branch into `main` and publish a release.
+4. Compare the new build with the deployed build. Copy each exe into `C:\Users\Max\.cache\cbm-bench\bin`, then run
+   one build at a time, because two index runs at once slow each other:
+   ```bash
+   python -I scripts/fleethd-bench.py run --label old --exe 'C:\Users\Max\.cache\cbm-bench\bin\cbm-old.exe' \
+     --cache 'C:\Users\Max\.cache\cbm-bench\old' --fresh --out 'C:\Users\Max\.cache\cbm-bench\results\old.json'
+   python -I scripts/fleethd-bench.py run --label new ...   # the same, with the new exe and cache
+   python -I scripts/fleethd-bench.py compare <old.json> <new.json> --md <report.md>
+   ```
+   The report gives the full index time and peak memory, the edges by type, the known-answer probes, the latency
+   of 8 queries on one server, and two bursts of 16 concurrent requests. Other sessions change the repos tree, so
+   run both builds in the same hour.
+5. Run upstream's native Windows guards against the new exe. `test_non_ascii_path` adds an entry to the real user
+   PATH and removes it again; after the run, check the user PATH for `cbm-windows-guards`. The wrapper isolates the
+   guards from the live daemon:
+   ```powershell
+   & scripts\fleethd-winguards.ps1 -Binary build\c\codebase-memory-mcp.exe
+   ```
+   On 2026-10-26, stock upstream `10ab613d` and the fork gave the same result: 6 guards pass, the drive-picker guard
+   is skipped and 2 fail. `test_daemon_stability` (`daemon start --port`) and `test_ui_drive_listing` need a UI
+   build, and FleetHd builds without the UI. The long-path uninstall step of `test_non_ascii_path` returns rc=1; the
+   cause is not known. Compare a new result with a stock build of the same upstream commit, made with the same
+   script.
+6. Merge the branch into `main` and publish a release.

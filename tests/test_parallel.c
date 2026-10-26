@@ -2967,18 +2967,28 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     static const char alias_field[] = "using SvcAlias = RepoE.Good.Service;\nnamespace RepoC;\n"
                                       "public class AliasField {\n    private SvcAlias _svc;\n"
                                       "    public void Go() { _svc.Run(); }\n}\n";
+    /* A base class with a constructor: the name resolves to the class, the visible one. */
+    static const char base_g[] = "namespace RepoG.Data;\npublic class RepoBase<T> {\n"
+                                 "    public RepoBase(int x) { }\n}\n";
+    static const char base_h[] = "namespace RepoH.Data;\npublic class RepoBase<T> {\n"
+                                 "    public RepoBase(int x) { }\n}\n";
+    static const char derived[] = "using RepoH.Data;\nnamespace RepoC;\n"
+                                  "public class VehicleRepo : RepoBase<int> {\n"
+                                  "    public VehicleRepo() : base(1) { }\n}\n";
     static const char *rels[] = {
         "repoA/src/VehicleDto.cs",    "repoB/src/VehicleDto.cs",  "repoC/src/User.cs",
         "repoC/src/AliasUser.cs",     "repoC/src/Guarded.cs",     "repoD/src/Results.cs",
         "repoC/src/Controller.cs",    "repoA/src/RegularController.cs",
         "aaaRepo/src/AaaController.cs", "repoC/src/ControllerTests.cs", "repoC/src/Flags.cs",
         "repoC/src/NsAliasUser.cs",   "repoC/src/Holder.cs",      "repoE/src/Service.cs",
-        "repoF/src/SvcAlias.cs",      "repoC/src/AliasField.cs",
+        "repoF/src/SvcAlias.cs",      "repoC/src/AliasField.cs",  "repoG/src/RepoBase.cs",
+        "repoH/src/RepoBase.cs",      "repoC/src/VehicleRepo.cs",
     };
     const char *srcs[] = {a_dto,    b_dto,      user,    alias_user, guarded,  results,
                           controller, regular,  other,   tests,      flags,    ns_alias,
-                          holder,   good_svc,   svc_decoy, alias_field};
-    enum { N_FILES = 16, N_CHECKS = 17 };
+                          holder,   good_svc,   svc_decoy, alias_field, base_g, base_h,
+                          derived};
+    enum { N_FILES = 19, N_CHECKS = 19 };
     const char *project = "cbm_fleethd_cs";
 
     char tmpdir[256];
@@ -3017,6 +3027,9 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
     const char *holder_class = "cbm_fleethd_cs.repoC.src.Holder.Holder";
     const char *good_run = "cbm_fleethd_cs.repoE.src.Service.Service.Run";
     const char *decoy_run = "cbm_fleethd_cs.repoF.src.SvcAlias.SvcAlias.Run";
+    const char *vehicle_repo = "cbm_fleethd_cs.repoC.src.VehicleRepo.VehicleRepo";
+    const char *base_h_class = "cbm_fleethd_cs.repoH.src.RepoBase.RepoBase";
+    const char *base_g_class = "cbm_fleethd_cs.repoG.src.RepoBase.RepoBase";
     bool ok[2][N_CHECKS];
     bool all = true;
     for (int g = 0; g < 2; g++) {
@@ -3040,6 +3053,9 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         ok[g][14] = !has_edge_qn_to_qn(gb, holder_class, a_class, "USAGE");
         ok[g][15] = has_edge_from_callable_to_qn(gb, "AliasField.Go", good_run, "CALLS");
         ok[g][16] = !has_edge_from_callable_to_qn(gb, "AliasField.Go", decoy_run, "CALLS");
+        ok[g][17] = has_edge_qn_to_qn(gb, vehicle_repo, base_h_class, "INHERITS");
+        ok[g][18] = cbm_gbuf_find_by_qn(gb, vehicle_repo) &&
+                    !has_edge_qn_to_qn(gb, vehicle_repo, base_g_class, "INHERITS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
         }
@@ -3048,10 +3064,11 @@ TEST(parallel_csharp_fleethd_visibility_patches) {
         for (int g = 0; g < 2; g++) {
             printf("  C# FleetHd diagnostic %s: using=%d/%d ctor=%d alias=%d/%d if_using=%d "
                    "framework_call=%d field_call=%d/%d static_receiver=%d/%d ns_alias=%d/%d "
-                   "qualified_generic=%d/%d alias_field=%d/%d\n",
+                   "qualified_generic=%d/%d alias_field=%d/%d base_with_ctor=%d/%d\n",
                    g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
                    ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10],
-                   ok[g][11], ok[g][12], ok[g][13], ok[g][14], ok[g][15], ok[g][16]);
+                   ok[g][11], ok[g][12], ok[g][13], ok[g][14], ok[g][15], ok[g][16], ok[g][17],
+                   ok[g][18]);
         }
     }
     cbm_gbuf_free(graphs[0]);

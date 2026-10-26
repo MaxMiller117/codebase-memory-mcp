@@ -647,7 +647,16 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
              * imported name, so it needs no external-base gate. */
             const char *base_qn = cbm_registry_resolve_python_class_body_base(
                 ctx->registry, ctx->gbuf, def->qualified_name, def->base_classes[b], lang);
-            if (!base_qn) {
+            if (!base_qn && lang == CBM_LANG_CSHARP) {
+                const cbm_gbuf_node_t *cs = cbm_pipeline_cs_base_node(
+                    ctx->registry, ctx->gbuf, ctx->project_name, result, fi->rel_path,
+                    def->base_classes[b], module_qn, imp_keys, imp_vals, imp_count,
+                    ctx->repo_path);
+                if (!cs) {
+                    continue;
+                }
+                base_qn = cs->qualified_name;
+            } else if (!base_qn) {
                 base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn, imp_keys,
                                            imp_vals, imp_count, lang);
                 if (!base_qn || cbm_python_external_base_contradicts(
