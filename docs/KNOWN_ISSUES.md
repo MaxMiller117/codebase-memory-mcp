@@ -4,6 +4,10 @@ These issues come from multi-agent use on the FleetHd monolith (one project, abo
 measured on 2026-10-24 on a full test index of `0.12.1-fleethd.1` (upstream `main` `10ab613d` plus the local
 patches in `LOCAL_PATCHES.md`), beside the live `0.11.0-fleethd.2` index.
 
+`0.12.1-fleethd.1` was deployed on 2026-10-26. On the live index of that day (`mode=moderate`, 390,677 nodes), the 3
+checks in `CLAUDE.md` pass, 570 `VehicleDto` edges go to `fleet-hd-contracts`, and 111 classes inherit
+`OrderedQueryRepository`.
+
 ## 1. A wrong `project` name does not fall back to the monolith
 
 Every query tool requires the exact project key `C-Users-Max-source-repos`. Agents often guess a short repo name
@@ -97,6 +101,9 @@ opens the index and reads its `projects` row in less than 1 ms. The FleetHd hook
 agent that calls `list_projects` waits.
 
 ## Fixed in `0.12.1-fleethd.1`
+
+Most of these entries come from the setup benchmark (`fleet-hd-claude/skills/setup-bench`), measured on the live
+`0.11.0-fleethd.2` index on 2026-10-23.
 
 - **Concurrent requests on one MCP server ran one at a time.** 16 concurrent requests to one server took 6.7 s
   (median latency 3.8 s), against 1.1 s on 16 separate servers. With local patch 8 and 4 connections they take
