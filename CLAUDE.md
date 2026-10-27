@@ -1,7 +1,7 @@
 # codebase-memory-mcp — FleetHd fork
 
-This fork is upstream DeusData v0.11.0 plus the local patches in `docs/LOCAL_PATCHES.md`. Version names use
-the form `0.11.0-fleethd.N`. Usage rules for agents (query forms, paging, known engine limits) are in
+This fork is upstream DeusData `main` (after v0.12.1) plus the local patches in `docs/LOCAL_PATCHES.md`. Version
+names use the form `<last upstream release>-fleethd.N`, for example `0.12.1-fleethd.1`. Usage rules for agents (query forms, paging, known engine limits) are in
 `~/.claude/docs/codebase-memory-mcp.md`; this file covers build, deploy and release only.
 
 ## Build (Windows binary, cross-compiled in WSL)
@@ -13,8 +13,8 @@ Use the llvm-mingw toolchain (clang + UCRT) in WSL `Ubuntu-24.04`, at `~/toolcha
 
 ```bash
 # In WSL, from the repo root. The first run also builds zlib into the toolchain (set ZLIB_TGZ to zlib-1.3.1.tar.gz).
-bash scripts/build-win-ucrt.sh 0.11.0-fleethd.N          # warm build, ~3 min
-bash scripts/build-win-ucrt.sh 0.11.0-fleethd.N clean    # cold build
+bash scripts/build-win-ucrt.sh 0.12.1-fleethd.N          # warm build, ~3 min
+bash scripts/build-win-ucrt.sh 0.12.1-fleethd.N clean    # cold build
 ```
 
 The output is `build/c/codebase-memory-mcp.exe`. The script fails if the binary does not link UCRT.
@@ -44,7 +44,7 @@ The shared plugin `fleet-hd-claude/plugins/codebase-memory-mcp` installs the Win
 this fork. To publish one:
 
 ```powershell
-$v = 'v0.11.0-fleethd.N'; $out = "$env:TEMP\cbm-release"; New-Item -ItemType Directory -Force $out | Out-Null
+$v = 'v0.12.1-fleethd.N'; $out = "$env:TEMP\cbm-release"; New-Item -ItemType Directory -Force $out | Out-Null
 Compress-Archive build\c\codebase-memory-mcp.exe "$out\codebase-memory-mcp-windows-amd64.zip" -Force
 $h = (Get-FileHash "$out\codebase-memory-mcp-windows-amd64.zip" -Algorithm SHA256).Hash.ToLower()
 "$h  codebase-memory-mcp-windows-amd64.zip" | Set-Content "$out\checksums.txt"
@@ -56,10 +56,61 @@ Then update the pinned tag in the plugin README with a PR on `fleet-hd-claude` (
 
 ## Update to a new upstream release
 
-1. Make a branch from the upstream tag and apply the patches in `docs/LOCAL_PATCHES.md`.
-2. Build, then index into the live cache only after all sessions close (see Deploy).
+1. Make a branch from upstream `main` (or a tag) in a worktree named `.wt-<name>`, and apply the patches in
+   `docs/LOCAL_PATCHES.md`.
+2. Build, then index into a test cache beside the live one. Both folders must be under `C:\Users\Max\.cache\`,
+   because a folder under `%TEMP%` fails the private-directory check. Create the runtime folder first:
+   ```bash
+   mkdir -p /c/Users/Max/.cache/cbm-test-rt
+   CBM_CACHE_DIR='C:\Users\Max\.cache\cbm-test' CBM_RUNTIME_DIR='C:\Users\Max\.cache\cbm-test-rt' \
+     build/c/codebase-memory-mcp.exe cli index_repository --repo-path C:/Users/Max/source/repos
+   ```
+   Run each check query with the same two variables set.
 3. Before the deploy, run these checks. Stock v0.11.0 failed each of them:
    - `MATCH (b {name:'FaultRuleDto'})<-[:USAGE]-(a {name:'AlertRuleDto'}) RETURN a.file_path` returns the `fleet-hd-contracts` row.
    - `search_graph(query="get async vehicle", file_pattern="*fleet-hd-alert-notification/*")` returns `total` greater than 0 with `total_relation: eq`.
    - `MATCH (b {name:'TroubleCodeDto'})<-[:USAGE]-(a) WHERE NOT (a.file_path CONTAINS 'Test') RETURN count(a)` returns a row.
-4. Merge the branch into `main` and publish a release.
+
+   Stock upstream `main` (2026-10-22) failed these, and the local patches 3 to 6 fix them:
+   - `MATCH (a)-[:USAGE]->(k {name:'IssueDto'}) RETURN k.label, count(a)` has no `Method` row (constructor).
+   - `MATCH (t {name:'VehicleDto'})<-[:USAGE]-(a) WHERE a.file_path CONTAINS 'samsara' RETURN t.file_path, count(a)`
+     returns only the `fleet-hd-samsara-contracts` row.
+   - `MATCH (m {name:'GetByVinAsync'})-[:CALLS]->(t) WHERE m.file_path CONTAINS 'TruckContextQueryController' RETURN t.name, t.file_path`
+     has no `Ok`, `NotFound` or `IsNullOrWhiteSpace` row.
+   - `MATCH (m)-[r:CALLS]->(t {name:'GetByVinAsync'}) WHERE m.file_path CONTAINS 'TruckContextQueryControllerTests' RETURN t.file_path, r.strategy, count(*)`
+     has a `cs_method_typed` row to `TruckContextQueryController.cs` (a call through the field `_sut`).
+   - `MATCH (t {name:'AlertRuleDto'})<-[:USAGE]-(m)-[:HANDLES]->(r:Route) RETURN count(DISTINCT m)` is greater than 0.
+
+   An incremental run must give the same edges as a full run. Index a fixture with two same-named classes in
+   different namespaces and a third repo that `using`s one of them, change only the third file, and index again.
+
+   Run upstream's suite on a copy inside WSL (`make -f Makefile.cbm test-par`). Copy with `tar
+   --no-same-permissions` and `chmod -R go-w`: a world-writable folder fails the `cli` install tests. The
+   fork's own tests are listed in `docs/LOCAL_PATCHES.md` under **Tests**; a merge conflict in one of them means
+   upstream changed the behaviour that the patch depends on.
+
+   To measure what a resolver change removes or adds, index a second copy with the change off (for patch 4,
+   `CBM_FLEETHD_NO_CS_VISIBILITY=1`) and diff the `edges` tables of the two databases.
+4. Compare the new build with the deployed build. Copy each exe into `C:\Users\Max\.cache\cbm-bench\bin`, then run
+   one build at a time, because two index runs at once slow each other:
+   ```bash
+   python -I scripts/fleethd-bench.py run --label old --exe 'C:\Users\Max\.cache\cbm-bench\bin\cbm-old.exe' \
+     --cache 'C:\Users\Max\.cache\cbm-bench\old' --fresh --out 'C:\Users\Max\.cache\cbm-bench\results\old.json'
+   python -I scripts/fleethd-bench.py run --label new ...   # the same, with the new exe and cache
+   python -I scripts/fleethd-bench.py compare <old.json> <new.json> --md <report.md>
+   ```
+   The report gives the full index time and peak memory, the edges by type, the known-answer probes, the latency
+   of 8 queries on one server, and two bursts of 16 concurrent requests. Other sessions change the repos tree, so
+   run both builds in the same hour.
+5. Run upstream's native Windows guards against the new exe. `test_non_ascii_path` adds an entry to the real user
+   PATH and removes it again; after the run, check the user PATH for `cbm-windows-guards`. The wrapper isolates the
+   guards from the live daemon:
+   ```powershell
+   & scripts\fleethd-winguards.ps1 -Binary build\c\codebase-memory-mcp.exe
+   ```
+   On 2026-10-26, stock upstream `10ab613d` and the fork gave the same result: 6 guards pass, the drive-picker guard
+   is skipped and 2 fail. `test_daemon_stability` (`daemon start --port`) and `test_ui_drive_listing` need a UI
+   build, and FleetHd builds without the UI. The long-path uninstall step of `test_non_ascii_path` returns rc=1; the
+   cause is not known. Compare a new result with a stock build of the same upstream commit, made with the same
+   script.
+6. Merge the branch into `main` and publish a release.

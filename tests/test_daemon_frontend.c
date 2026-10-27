@@ -1274,6 +1274,27 @@ TEST(daemon_frontend_correlates_cancellation_to_exact_request) {
     PASS();
 }
 
+/* #2144 (a): the -32800 reply to a cancelled index_repository call is the one
+ * text a deadline-bound client can still read, so it names the async mode;
+ * other requests and unparseable input keep the plain message. */
+TEST(daemon_frontend_cancelled_index_reply_offers_async_issue2144) {
+    const char *index_reply = cbm_daemon_frontend_cancelled_error_message(
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"/r\"}}}");
+    ASSERT_NOT_NULL(strstr(index_reply, "Request cancelled"));
+    ASSERT_NOT_NULL(strstr(index_reply, "async: true"));
+    ASSERT_NOT_NULL(strstr(index_reply, "status: true"));
+    ASSERT_NULL(strchr(index_reply, '"'));
+    ASSERT_NULL(strchr(index_reply, '\\'));
+    ASSERT_STR_EQ(cbm_daemon_frontend_cancelled_error_message(
+                      "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\","
+                      "\"params\":{\"name\":\"search_graph\",\"arguments\":{}}}"),
+                  "Request cancelled");
+    ASSERT_STR_EQ(cbm_daemon_frontend_cancelled_error_message("not json"), "Request cancelled");
+    ASSERT_STR_EQ(cbm_daemon_frontend_cancelled_error_message(NULL), "Request cancelled");
+    PASS();
+}
+
 TEST(daemon_frontend_ignores_cancellation_text_in_string_content) {
     ASSERT_FALSE(cbm_daemon_frontend_is_cancellation_notification(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
@@ -1638,6 +1659,234 @@ TEST(daemon_frontend_stdout_backpressure_maintenance_stops_and_cancels_session) 
     ASSERT_TRUE(frontend_backpressure_run_isolated(true));
     PASS();
 }
+
+/* FleetHd local patch: cbm_daemon_frontend_mcp_run_pool. Read-only tool calls that
+ * queue behind a busy connection open another connection of the session and run in
+ * parallel; every request still receives exactly one response. */
+typedef struct {
+    atomic_int in_flight;
+    atomic_int max_in_flight;
+    atomic_bool release;
+} frontend_pool_application_t;
+
+static cbm_daemon_runtime_application_session_t *frontend_pool_session_open(
+    void *opaque, cbm_daemon_client_id_t client_id, uint64_t authenticated_process_id) {
+    (void)opaque;
+    (void)client_id;
+    (void)authenticated_process_id;
+    return (cbm_daemon_runtime_application_session_t *)calloc(1, 1);
+}
+
+static cbm_daemon_runtime_application_status_t frontend_pool_request(
+    void *opaque, cbm_daemon_runtime_application_session_t *session,
+    cbm_daemon_runtime_application_token_t request_token, const uint8_t *request,
+    uint32_t request_length, uint8_t **response_out, uint32_t *response_length_out) {
+    (void)session;
+    (void)request_token;
+    frontend_pool_application_t *app = opaque;
+    *response_out = NULL;
+    *response_length_out = 0;
+    char *text = calloc(1, (size_t)request_length + 1);
+    if (!text) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    }
+    if (request_length > 0) {
+        memcpy(text, request, request_length);
+    }
+    bool tool_call = strstr(text, "\"tools/call\"") != NULL;
+    if (tool_call) {
+        int now = atomic_fetch_add_explicit(&app->in_flight, 1, memory_order_acq_rel) + 1;
+        int seen = atomic_load_explicit(&app->max_in_flight, memory_order_acquire);
+        while (now > seen && !atomic_compare_exchange_weak(&app->max_in_flight, &seen, now)) {
+        }
+        uint64_t deadline = cbm_now_ms() + FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS;
+        while (!atomic_load_explicit(&app->release, memory_order_acquire) &&
+               cbm_now_ms() < deadline) {
+            cbm_usleep(1000);
+        }
+        (void)atomic_fetch_sub_explicit(&app->in_flight, 1, memory_order_acq_rel);
+    }
+    bool notification = strstr(text, "\"id\"") == NULL;
+    if (notification) {
+        free(text);
+        return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    }
+    *response_out = (uint8_t *)text;
+    *response_length_out = request_length;
+    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
+static void frontend_pool_request_cancel(void *opaque,
+                                         cbm_daemon_runtime_application_session_t *session,
+                                         cbm_daemon_runtime_application_token_t request_token) {
+    (void)opaque;
+    (void)session;
+    (void)request_token;
+}
+
+static void frontend_pool_session_cancel(void *opaque,
+                                         cbm_daemon_runtime_application_session_t *session) {
+    (void)opaque;
+    (void)session;
+}
+
+static void frontend_pool_session_close(void *opaque,
+                                        cbm_daemon_runtime_application_session_t *session) {
+    (void)opaque;
+    free(session);
+}
+
+typedef struct {
+    cbm_daemon_ipc_endpoint_t *endpoint;
+    cbm_daemon_build_identity_t identity;
+} frontend_pool_lane_context_t;
+
+static cbm_daemon_runtime_client_t *frontend_pool_open_lane(void *opaque) {
+    frontend_pool_lane_context_t *context = opaque;
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    return cbm_daemon_runtime_client_connect(context->endpoint, &context->identity,
+                                             FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS, &connect_result);
+}
+
+typedef struct {
+    int fd;
+    frontend_pool_application_t *app;
+    atomic_bool succeeded;
+} frontend_pool_writer_t;
+
+static void *frontend_pool_writer(void *opaque) {
+    frontend_pool_writer_t *writer = opaque;
+    static const char handshake[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n"
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+    bool ok = frontend_eof_write_all(writer->fd, handshake, sizeof(handshake) - 1);
+    cbm_usleep(200 * 1000); /* lane 0 completes `initialize` */
+    for (int i = 0; ok && i < 4; i++) {
+        char message[200];
+        int written = snprintf(message, sizeof(message),
+                               "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+                               "\"params\":{\"name\":\"search_graph\",\"arguments\":{}}}\n",
+                               10 + i);
+        ok = written > 0 && frontend_eof_write_all(writer->fd, message, (size_t)written);
+    }
+    uint64_t deadline = cbm_now_ms() + 10000;
+    while (ok && atomic_load_explicit(&writer->app->max_in_flight, memory_order_acquire) < 2 &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    atomic_store_explicit(&writer->app->release, true, memory_order_release);
+    ok = close(writer->fd) == 0 && ok;
+    atomic_store_explicit(&writer->succeeded, ok, memory_order_release);
+    return NULL;
+}
+
+static int frontend_pool_child_run(const char *parent) {
+    frontend_pool_application_t app;
+    atomic_init(&app.in_flight, 0);
+    atomic_init(&app.max_in_flight, 0);
+    atomic_init(&app.release, false);
+    char key[CBM_DAEMON_KEY_SIZE];
+    char build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char conflict_log[FRONTEND_TEST_PATH_CAP];
+    (void)snprintf(conflict_log, sizeof(conflict_log), "%s/conflicts.ndjson", parent);
+    if (!cbm_daemon_rendezvous_key(key) ||
+        !cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), build)) {
+        return 80;
+    }
+    frontend_pool_lane_context_t lanes = {
+        .endpoint = cbm_daemon_ipc_endpoint_new(key, parent),
+        .identity = {.semantic_version = "2.4.0",
+                     .build_fingerprint = build,
+                     .cache_fingerprint = FRONTEND_TEST_CACHE,
+                     .protocol_abi = 3,
+                     .store_abi = 11,
+                     .feature_abi = 7},
+    };
+    cbm_version_cohort_manager_t *manager =
+        lanes.endpoint ? cbm_version_cohort_manager_new(lanes.endpoint) : NULL;
+    cbm_daemon_runtime_service_config_t config = {
+        .endpoint = lanes.endpoint,
+        .identity = lanes.identity,
+        .conflict_log_path = conflict_log,
+        .conflict_log_cap_bytes = 64U * 1024U,
+        .max_clients = 8,
+        .lease_timeout_ms = 5000,
+        .request_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+        .shutdown_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+        .application = {.context = &app,
+                        .session_open = frontend_pool_session_open,
+                        .request = frontend_pool_request,
+                        .request_cancel = frontend_pool_request_cancel,
+                        .session_cancel = frontend_pool_session_cancel,
+                        .session_close = frontend_pool_session_close},
+    };
+    cbm_daemon_runtime_service_t *service =
+        manager ? cbm_daemon_runtime_service_start(&config) : NULL;
+    cbm_daemon_runtime_client_t *client = service ? frontend_pool_open_lane(&lanes) : NULL;
+    int input_pipe[2] = {-1, -1};
+    if (!client || pipe(input_pipe) != 0) {
+        return 81;
+    }
+    FILE *input = fdopen(input_pipe[0], "rb");
+    FILE *output = tmpfile();
+    frontend_pool_writer_t writer = {.fd = input_pipe[1], .app = &app};
+    atomic_init(&writer.succeeded, false);
+    cbm_thread_t writer_thread;
+    if (!input || !output || cbm_thread_create(&writer_thread, 0, frontend_pool_writer, &writer) != 0) {
+        return 82;
+    }
+    int result = cbm_daemon_frontend_mcp_run_pool(client, frontend_pool_open_lane, &lanes, 4,
+                                                  manager, input, output);
+    bool joined = cbm_thread_join(&writer_thread) == 0;
+    int responses = 0;
+    char line[512];
+    rewind(output);
+    while (fgets(line, sizeof(line), output)) {
+        responses += strstr(line, "\"id\"") != NULL ? 1 : 0;
+    }
+    int max_in_flight = atomic_load_explicit(&app.max_in_flight, memory_order_acquire);
+    (void)fclose(input);
+    (void)fclose(output);
+    if (service) {
+        (void)cbm_daemon_runtime_service_stop(service, FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS);
+        (void)cbm_daemon_runtime_service_free(service);
+    }
+    if (manager) {
+        (void)cbm_version_cohort_manager_free(&manager);
+    }
+    cbm_daemon_ipc_endpoint_free(lanes.endpoint);
+    if (result != 0 || !joined || !atomic_load_explicit(&writer.succeeded, memory_order_acquire)) {
+        return 83;
+    }
+    if (responses != 5) {
+        return 84;
+    }
+    return max_in_flight >= 2 ? 0 : 85;
+}
+
+TEST(daemon_frontend_pool_runs_read_only_calls_in_parallel) {
+    char parent[FRONTEND_TEST_PATH_CAP];
+    int written = snprintf(parent, sizeof(parent), "%s/cbm-frontend-pool-XXXXXX", cbm_tmpdir());
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(parent) && cbm_mkdtemp(parent));
+    pid_t child = fork();
+    if (child == 0) {
+        (void)signal(SIGALRM, SIG_DFL);
+        (void)alarm(FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S);
+        _exit(frontend_pool_child_run(parent));
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = child > 0 ? waitpid(child, &status, 0) : -1;
+    } while (waited < 0 && errno == EINTR);
+    (void)th_rmtree(parent);
+    int code = waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code != 0) {
+        printf("  frontend pool child exit code %d\n", code);
+    }
+    ASSERT_EQ(code, 0);
+    PASS();
+}
 #endif
 
 TEST(daemon_local_participant_monitor_joins_before_manager_teardown) {
@@ -1659,6 +1908,7 @@ TEST(daemon_local_participant_monitor_joins_before_manager_teardown) {
 SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_recognizes_exact_cancellation_notification);
     RUN_TEST(daemon_frontend_correlates_cancellation_to_exact_request);
+    RUN_TEST(daemon_frontend_cancelled_index_reply_offers_async_issue2144);
     RUN_TEST(daemon_frontend_ignores_cancellation_text_in_string_content);
     RUN_TEST(daemon_frontend_rejects_non_notification_cancellation_shapes);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
@@ -1672,6 +1922,7 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success);
     RUN_TEST(daemon_frontend_stdout_backpressure_eof_fail_stops_and_cancels_session);
     RUN_TEST(daemon_frontend_stdout_backpressure_maintenance_stops_and_cancels_session);
+    RUN_TEST(daemon_frontend_pool_runs_read_only_calls_in_parallel);
 #endif
     RUN_TEST(daemon_local_participant_monitor_joins_before_manager_teardown);
 }

@@ -29,6 +29,12 @@ bool cbm_daemon_frontend_is_cancellation_notification(const char *message);
 bool cbm_daemon_frontend_cancellation_matches_request(const char *message, int64_t active_id,
                                                       const char *active_id_str);
 
+/* The JSON-RPC error message answered for a cancelled request (#2144). A
+ * cancelled index_repository call is usually a client deadline on a long
+ * index, so its reply names the async alternative; every other request keeps
+ * the plain message. Returns a static string free of JSON metacharacters. */
+const char *cbm_daemon_frontend_cancelled_error_message(const char *request_message);
+
 /* Start a temporary observer for a one-shot local CLI command or physical
  * supervised worker. manager and cancel_context are borrowed until stop. On
  * maintenance intent the observer invokes cancel once, permits a fixed bounded
@@ -64,5 +70,19 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
  * process so an agent waiting with stdin still open observes server EOF. */
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
                                 cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out);
+
+/* FleetHd local patch: as cbm_daemon_frontend_mcp_run, but read-only tool calls may run
+ * in parallel on up to `lane_limit` - 1 more connections of the same session. A
+ * connection opens (through `open_lane`) only when read-only calls are queued and every
+ * open connection is busy, because the daemon accepts at most 64 connections in total.
+ * Every other message runs on `client` in arrival order. The frontend owns and closes
+ * every client. */
+enum { CBM_DAEMON_FRONTEND_MAX_LANES = 8 };
+typedef cbm_daemon_runtime_client_t *(*cbm_daemon_frontend_open_lane_fn)(void *context);
+int cbm_daemon_frontend_mcp_run_pool(cbm_daemon_runtime_client_t *client,
+                                     cbm_daemon_frontend_open_lane_fn open_lane,
+                                     void *open_context, int lane_limit,
+                                     cbm_version_cohort_manager_t *cohort_manager, FILE *in,
+                                     FILE *out);
 
 #endif /* CBM_DAEMON_FRONTEND_H */

@@ -16,6 +16,7 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
 #include <foundation/platform.h>
@@ -543,6 +544,71 @@ TEST(incr_formatter_run) {
     printf("    [perf] reformat 50 files: %.0fms, node_diff=%d edge_diff=%d\n", ms, node_diff,
            edge_diff);
 
+    PASS();
+}
+
+static char g_purge_log[8192];
+static int g_purge_progress_lines;
+
+static void purge_log_sink(const char *line) {
+    if (!line || !strstr(line, "msg=incremental.purge")) {
+        return;
+    }
+    if (strstr(line, "msg=incremental.purge.progress")) {
+        g_purge_progress_lines++;
+    }
+    size_t used = strlen(g_purge_log);
+    (void)snprintf(g_purge_log + used, sizeof(g_purge_log) - used, "%s\n", line);
+}
+
+/* #1300: the per-file purge after incremental.edge_snapshot logged nothing
+ * until it finished, so a stall there left no trace of where the run was. It
+ * now announces its counts and reports bounded progress — counts only, at
+ * most 20 progress lines however many files, ending at files_done ==
+ * files_total. */
+TEST(incr_purge_reports_bounded_progress_issue1300) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    reformat_files("fastapi", 30);
+    /* The loop instrumented for #1300 sits on the legacy partial route (the
+     * production closure route purges in SQL and logs delta.snapshot_purge). */
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_purge_log[0] = '\0';
+    g_purge_progress_lines = 0;
+    cbm_log_set_sink_ex(purge_log_sink, CBM_LOG_SINK_TEE);
+    resp = index_repo();
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+
+    const char *start = strstr(g_purge_log, "msg=incremental.purge.start");
+    ASSERT(start != NULL);
+    int changed = -1;
+    int deleted = -1;
+    const char *changed_at = strstr(start, "changed=");
+    const char *deleted_at = strstr(start, "deleted=");
+    ASSERT(changed_at != NULL && deleted_at != NULL);
+    changed = atoi(changed_at + strlen("changed="));
+    deleted = atoi(deleted_at + strlen("deleted="));
+    int total = changed + deleted;
+    ASSERT_GT(total, 20); /* enough files that one line per file would exceed the bound */
+    ASSERT_GT(g_purge_progress_lines, 0);
+    ASSERT(g_purge_progress_lines <= 21);
+    ASSERT(g_purge_progress_lines < total); /* never one line per file */
+    char last[64];
+    (void)snprintf(last, sizeof(last), "files_done=%d files_total=%d", total, total);
+    ASSERT(strstr(g_purge_log, last) != NULL);
+    ASSERT(strstr(g_purge_log, "msg=incremental.purge elapsed_ms=") != NULL);
     PASS();
 }
 
@@ -3034,6 +3100,53 @@ TEST(tool_arch_empty_aspects) {
     PASS();
 }
 
+/* FleetHd local patch 4: an incremental run binds a C# name guess like a full run.
+ * Only User.cs changes, so the namespaces of the two VehicleDto files must come from
+ * cbm_pipeline_cs_ns_add_unchanged, not from extraction. */
+TEST(incr_csharp_visibility_matches_full_run) {
+    static const char *const fixture[][2] = {
+        {"repoA/src/VehicleDto.cs", "namespace RepoA.Dtos\n{\n    public class VehicleDto { }\n}\n"},
+        {"repoB/src/VehicleDto.cs", "namespace RepoB.Dtos\n{\n    public class VehicleDto { }\n}\n"},
+        {"repoC/src/User.cs", "using RepoB.Dtos;\n\nnamespace RepoC\n{\n    public class User\n"
+                              "    {\n        public VehicleDto Load() { return null; }\n    }\n}\n"},
+    };
+    char dir[640];
+    snprintf(dir, sizeof(dir), "%s/cs_visibility", g_tmpdir);
+    char path[900];
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, fixture[i][0]);
+        ASSERT_EQ(th_write_file(path, fixture[i][1]), 0);
+    }
+    char *project = cbm_project_name_from_path(dir);
+    ASSERT_NOT_NULL(project);
+    const char *query = "MATCH (m {name:'Load'})-[:USAGE]->(t {name:'VehicleDto'}) RETURN t.file_path";
+    bool full_ok = false;
+    bool incr_ok = false;
+    for (int run = 0; run < 2; run++) {
+        if (run == 1) {
+            snprintf(path, sizeof(path), "%s/repoC/src/User.cs", dir);
+            th_append_file(path, "// edited\n");
+        }
+        char *resp = call_tool("index_repository", "{\"repo_path\":\"%s\"}", dir);
+        ASSERT_NOT_NULL(resp);
+        free(resp);
+        resp = call_tool("query_graph", "{\"project\":\"%s\",\"query\":\"%s\"}", project, query);
+        ASSERT_NOT_NULL(resp);
+        bool ok = strstr(resp, "repoB/src/VehicleDto.cs") && !strstr(resp, "repoA/src/VehicleDto.cs");
+        if (!ok) {
+            printf("  C# visibility %s run: %.300s\n", run == 0 ? "full" : "incremental", resp);
+        }
+        *(run == 0 ? &full_ok : &incr_ok) = ok;
+        free(resp);
+    }
+    char *resp = call_tool("delete_project", "{\"project\":\"%s\"}", project);
+    free(resp);
+    free(project);
+    ASSERT_TRUE(full_ok);
+    ASSERT_TRUE(incr_ok);
+    PASS();
+}
+
 /* ── delete_project: real delete + verify ──────────────────────── */
 /* NOTE: This is destructive — must run LAST */
 
@@ -3349,9 +3462,15 @@ SUITE(incremental) {
     RUN_TEST(tool_err_ingest_bad_project);
     RUN_TEST(tool_err_ingest_no_traces);
 
+    /* #1300: legacy-partial purge progress (the full rebuild below resets the graph) */
+    RUN_TEST(incr_purge_reports_bounded_progress_issue1300);
+
     /* Phase 40: index_repository mode=full + arch empty aspects */
     RUN_TEST(tool_index_mode_full);
     RUN_TEST(tool_arch_empty_aspects);
+
+    /* FleetHd local patch 4: incremental runs keep C# namespace visibility */
+    RUN_TEST(incr_csharp_visibility_matches_full_run);
 
     /* Phase 41: delete_project real flow (MUST BE LAST) */
     RUN_TEST(tool_delete_and_verify);

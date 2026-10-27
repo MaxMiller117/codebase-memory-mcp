@@ -108,12 +108,22 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
     if (!type_name || !type_name[0]) {
         return;
     }
+    // A TypeScript type_annotation's text starts with ": ".
+    while (*type_name == ':' || *type_name == ' ' || *type_name == '\t') {
+        type_name++;
+    }
     type_name = clean_type_name(ctx->arena, type_name);
     if (!type_name || !type_name[0]) {
         return;
     }
     if (is_builtin_type(type_name)) {
         return;
+    }
+    // Only a (qualified) type name; a function or union type such as `() => void` is not one.
+    for (const char *p = type_name; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '.' && *p != '$') {
+            return;
+        }
     }
 
     CBMUsage usage = {0};
@@ -390,6 +400,21 @@ static void extract_csharp_type_refs(CBMExtractCtx *ctx, TSNode type_node,
     } else if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0 ||
                strcmp(kind, "qualified_name") == 0) {
         add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), enclosing_qn);
+        // `Ns.List<T>`: the type arguments sit in the generic_name segment.
+        uint32_t nc = ts_node_named_child_count(type_node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode seg = ts_node_named_child(type_node, i);
+            if (strcmp(ts_node_type(seg), "generic_name") != 0) {
+                continue;
+            }
+            uint32_t sc = ts_node_named_child_count(seg);
+            for (uint32_t j = 0; j < sc; j++) {
+                TSNode args = ts_node_named_child(seg, j);
+                if (strcmp(ts_node_type(args), "type_argument_list") == 0) {
+                    extract_csharp_type_refs(ctx, args, enclosing_qn);
+                }
+            }
+        }
     } else if (strcmp(kind, "nullable_type") == 0) {
         // T? — unwrap to T
         if (ts_node_child_count(type_node) > 0) {

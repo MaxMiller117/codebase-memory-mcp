@@ -74,6 +74,8 @@ static char *cs_node_text_cached(CSLSPContext *ctx, TSNode node);
 static const CBMType *cs_unwrap_task(CSLSPContext *ctx, const CBMType *t);
 static const CBMType *cs_unwrap_nullable(const CBMType *t);
 static const char *cs_resolve_callable_value(CSLSPContext *ctx, TSNode node, TSNode *callable_leaf);
+static const char *cs_top_level_namespace(const char *type_qn, const char *short_name,
+                                          const char *module_qn, const char *namespace_name);
 
 /* ── small helpers ──────────────────────────────────────────────── */
 
@@ -356,6 +358,72 @@ static const char *cs_try_type_qn(CSLSPContext *ctx, const char *qn) {
     return NULL;
 }
 
+/* Namespaces through which `qualifier` (the part of a type reference before
+ * its simple name, NULL for a simple name) can reach a top-level type, in C#
+ * lookup order: each enclosing namespace innermost outward, then the global
+ * namespace (qualified references only) or the file's `using` namespaces
+ * (simple names only -- a using-namespace directive does not import nested
+ * namespaces). Returns the count written to `out` (at most `cap`). */
+static int cs_visible_namespaces(CSLSPContext *ctx, const char *qualifier, const char **out,
+                                 int cap) {
+    int n = 0;
+    const char *ns = ctx->namespace_count > 0 ? cs_namespace_qn(ctx) : NULL;
+    while (ns && *ns && n < cap) {
+        out[n++] = qualifier ? cbm_arena_sprintf(ctx->arena, "%s.%s", ns, qualifier) : ns;
+        const char *dot = strrchr(ns, '.');
+        ns = dot ? cbm_arena_strndup(ctx->arena, ns, (size_t)(dot - ns)) : NULL;
+    }
+    if (qualifier) {
+        if (n < cap)
+            out[n++] = qualifier;
+        return n;
+    }
+    for (int i = 0; i < ctx->using_count && n < cap; i++) {
+        const CBMCSUsing *u = &ctx->usings[i];
+        if (u->kind == CBM_CS_USING_NAMESPACE && u->target_qn && u->target_qn[0])
+            out[n++] = u->target_qn;
+    }
+    return n;
+}
+
+/* Bind a (possibly namespace-qualified) type reference to the project type
+ * whose DECLARED namespace the current file can see, preferring the earliest
+ * namespace in C# lookup order; equal ranks keep registration order. NULL when
+ * no top-level type with that simple name is visible (#2120). */
+static const char *cs_resolve_by_declared_namespace(CSLSPContext *ctx, const char *name) {
+    if (!ctx->registry || !name || !*name)
+        return NULL;
+    const char *simple = cs_short_name(name);
+    if (!simple || !*simple)
+        return NULL;
+    const char *qualifier =
+        simple > name ? cbm_arena_strndup(ctx->arena, name, (size_t)(simple - name - 1)) : NULL;
+    enum { CS_VISIBLE_NS_MAX = 128 };
+    const char *visible[CS_VISIBLE_NS_MAX];
+    int visible_count = cs_visible_namespaces(ctx, qualifier, visible, CS_VISIBLE_NS_MAX);
+    if (visible_count == 0)
+        return NULL;
+
+    const CBMRegisteredType *best = NULL;
+    int best_rank = visible_count;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, simple, &it);
+    int i;
+    while ((i = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType *cand = &it.reg->types[i];
+        if (!cand->namespace_qn || !cand->short_name || strcmp(cand->short_name, simple) != 0)
+            continue;
+        for (int r = 0; r < best_rank; r++) {
+            if (strcmp(cand->namespace_qn, visible[r]) == 0) {
+                best = cand;
+                best_rank = r;
+                break;
+            }
+        }
+    }
+    return best ? best->qualified_name : NULL;
+}
+
 /* Returns a fully-qualified type name resolved against:
  *   1. predefined alias (int -> System.Int32)
  *   2. type-parameter substitution map
@@ -365,7 +433,9 @@ static const char *cs_try_type_qn(CSLSPContext *ctx, const char *qn) {
  *   6. module-prefixed (file-local QN that the unified extractor produced)
  *   7. each `using namespace X` prefix
  *   8. each `using A = X` alias substitution
- *   9. fall back to bare name (registry will fail; pipeline drops the call)
+ *   8b. declared namespace of a top-level project type (enclosing namespaces,
+ *       then `using` namespaces)
+ *   9. short-name fallback, then the bare name (registry miss drops the call)
  */
 const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
     if (!raw || !*raw)
@@ -457,6 +527,11 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
                 char *target_bare = cs_strip_generic_args(ctx->arena, u->target_qn);
                 if (target_bare && cs_lookup_type_qn(ctx, target_bare))
                     return target_bare;
+                /* A project type is registered under its path-derived QN, so
+                 * `using A = Ns.Type;` binds through the declared namespace. */
+                const char *declared = cs_resolve_by_declared_namespace(ctx, target_bare);
+                if (declared)
+                    return declared;
                 return cbm_arena_strdup(ctx->arena, u->target_qn);
             }
             if (bare[alias_len] == '.') {
@@ -468,6 +543,15 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
                     return try_qn;
             }
         }
+    }
+
+    /* 8b. Declared-namespace binding for project types (#2120): their QNs are
+     * path-derived, so steps 5 and 7 cannot hit them; bind by the namespace
+     * each top-level type declares, in C# lookup order. */
+    {
+        const char *declared = cs_resolve_by_declared_namespace(ctx, bare);
+        if (declared)
+            return declared;
     }
 
     /* 9. Short-name fallback: scan the registry for any type whose
@@ -525,6 +609,28 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
     return bare;
 }
 
+/* Other top-level declarations of the type `t` names: same simple name, same
+ * declared namespace, different entry. Registration order; at most `cap`. */
+static int cs_namespace_twins(CSLSPContext *ctx, const CBMRegisteredType *t,
+                              const CBMRegisteredType **out, int cap) {
+    if (!ctx->registry || !t || !t->namespace_qn || !t->short_name)
+        return 0;
+    int n = 0;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, t->short_name, &it);
+    int i;
+    while (n < cap && (i = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType *c = &it.reg->types[i];
+        if (!c->namespace_qn || !c->short_name || !c->qualified_name ||
+            strcmp(c->short_name, t->short_name) != 0 ||
+            strcmp(c->namespace_qn, t->namespace_qn) != 0 ||
+            strcmp(c->qualified_name, t->qualified_name) == 0)
+            continue;
+        out[n++] = c;
+    }
+    return n;
+}
+
 /* Look up a method on a type, walking inheritance chain. */
 const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn,
                                           const char *method_name) {
@@ -535,19 +641,34 @@ const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn
     if (f)
         return f;
 
-    /* Walk inheritance chain (base + interfaces + transitive bases). */
     const CBMRegisteredType *t = cs_lookup_type_qn(ctx, type_qn);
     if (!t)
         return NULL;
 
+    /* The other declarations of this same type -- `partial` pieces in other
+     * files, reference-assembly copies -- are separate registry entries
+     * (path-derived QNs) but one C# type: a member declared on any of them is
+     * a member of this one, and so is a base declared on any of them. */
+    const CBMRegisteredType *twins[CS_LSP_PARENT_WALK_MAX] = {0};
+    int twin_count = cs_namespace_twins(ctx, t, twins, CS_LSP_PARENT_WALK_MAX);
+    for (int k = 0; k < twin_count; k++) {
+        f = cbm_registry_lookup_method(ctx->registry, twins[k]->qualified_name, method_name);
+        if (f)
+            return f;
+    }
+
+    /* Walk inheritance chain (base + interfaces + transitive bases). */
     const char *visited[CS_LSP_PARENT_WALK_MAX];
     int visited_count = 0;
     const char *frontier[CS_LSP_PARENT_WALK_MAX];
     int frontier_count = 0;
 
-    if (t->embedded_types) {
-        for (int i = 0; t->embedded_types[i] && frontier_count < CS_LSP_PARENT_WALK_MAX; i++) {
-            frontier[frontier_count++] = t->embedded_types[i];
+    for (int k = -1; k < twin_count; k++) {
+        const CBMRegisteredType *decl = k < 0 ? t : twins[k];
+        for (int i = 0; decl->embedded_types && decl->embedded_types[i] &&
+                        frontier_count < CS_LSP_PARENT_WALK_MAX;
+             i++) {
+            frontier[frontier_count++] = decl->embedded_types[i];
         }
     }
 
@@ -1072,6 +1193,10 @@ const CBMType *cs_eval_expr_type(CSLSPContext *ctx, TSNode node) {
 
 /* ── identifier resolution ──────────────────────────────────────── */
 
+static const CBMType *cs_member_field_type(const CSLSPContext *ctx, const CBMRegisteredType *rt,
+                                           const char *class_qn, const char *name,
+                                           bool *found); /* defined with cs_fields_t below */
+
 static const CBMType *cs_eval_identifier_type(CSLSPContext *ctx, TSNode node) {
     char *name = cs_node_text(ctx, node);
     if (!name)
@@ -1087,14 +1212,10 @@ static const CBMType *cs_eval_identifier_type(CSLSPContext *ctx, TSNode node) {
     /* Implicit `this` member. Try to find a field on the enclosing class. */
     if (ctx->enclosing_class_qn) {
         const CBMRegisteredType *rt = cs_lookup_type_qn(ctx, ctx->enclosing_class_qn);
-        if (rt && rt->field_names) {
-            for (int i = 0; rt->field_names[i]; i++) {
-                if (strcmp(rt->field_names[i], name) == 0) {
-                    if (rt->field_types && rt->field_types[i])
-                        return rt->field_types[i];
-                    return cbm_type_unknown();
-                }
-            }
+        bool found = false;
+        const CBMType *ft = cs_member_field_type(ctx, rt, ctx->enclosing_class_qn, name, &found);
+        if (found) {
+            return ft;
         }
     }
 
@@ -1318,6 +1439,14 @@ static const CBMType *cs_eval_member_access_type(CSLSPContext *ctx, TSNode node)
     }
     if (!type_qn)
         return cbm_type_unknown();
+    /* FleetHd local patch: a member declared in this file (`this._field`). */
+    if (recv->kind != CBM_TYPE_TEMPLATE) {
+        bool local_found = false;
+        const CBMType *lt = cs_member_field_type(ctx, NULL, type_qn, fname, &local_found);
+        if (local_found && lt && lt->kind != CBM_TYPE_UNKNOWN) {
+            return lt;
+        }
+    }
     const CBMRegisteredType *rt = cs_lookup_type_qn(ctx, type_qn);
     if (rt && rt->field_names) {
         for (int i = 0; rt->field_names[i]; i++) {
@@ -3029,6 +3158,37 @@ typedef struct {
     int cap;
 } cs_fields_table_t;
 
+/* FleetHd local patch: the declared type of member `name` of `class_qn`, from this file's
+ * own declarations first, then from the registered type `rt`. *found reports a member. */
+static const CBMType *cs_member_field_type(const CSLSPContext *ctx, const CBMRegisteredType *rt,
+                                           const char *class_qn, const char *name,
+                                           bool *found) {
+    *found = false;
+    const cs_fields_table_t *tab = ctx->file_fields;
+    for (int i = 0; tab && class_qn && i < tab->count; i++) {
+        const cs_fields_t *f = &tab->items[i];
+        if (strcmp(f->class_qn, class_qn) != 0) {
+            continue;
+        }
+        for (int j = 0; j < f->count; j++) {
+            if (strcmp(f->field_names[j], name) == 0) {
+                *found = true;
+                return f->field_types[j] ? f->field_types[j] : cbm_type_unknown();
+            }
+        }
+    }
+    if (rt && rt->field_names) {
+        for (int i = 0; rt->field_names[i]; i++) {
+            if (strcmp(rt->field_names[i], name) == 0) {
+                *found = true;
+                return rt->field_types && rt->field_types[i] ? rt->field_types[i]
+                                                             : cbm_type_unknown();
+            }
+        }
+    }
+    return NULL;
+}
+
 static cs_fields_t *cs_fields_get(CBMArena *arena, cs_fields_table_t *tab, const char *class_qn) {
     for (int i = 0; i < tab->count; i++) {
         if (strcmp(tab->items[i].class_qn, class_qn) == 0)
@@ -3225,6 +3385,40 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
         }
     }
     (void)reg;
+}
+
+/* FleetHd local patch: the cross-file pass registers types from definitions, which carry
+ * no fields, so `_service.Method()` stayed untyped. Collect this file's fields against the
+ * cross-file registry, inside the file's namespace, and expose them on ctx. */
+static void cs_collect_file_fields(CSLSPContext *ctx, TSNode root, cs_fields_table_t *tab) {
+    /* A field typed by a `using A = N.T;` alias resolves through the alias. */
+    cs_collect_imports(ctx, root);
+    TSNode stack[64];
+    int top = 0;
+    stack[top++] = root;
+    while (top > 0) {
+        TSNode n = stack[--top];
+        const char *k = ts_node_type(n);
+        if (strcmp(k, "namespace_declaration") == 0 ||
+            strcmp(k, "file_scoped_namespace_declaration") == 0) {
+            TSNode nm = ts_node_child_by_field_name(n, "name", 4);
+            char *ns = ts_node_is_null(nm) ? NULL : cs_node_text(ctx, nm);
+            if (ns) {
+                cs_namespace_push(ctx, ns);
+            }
+            break;
+        }
+        if (n.id != root.id && strncmp(k, "preproc_", 8) != 0) {
+            continue;
+        }
+        uint32_t nc = ts_node_named_child_count(n);
+        for (int i = (int)nc - 1; i >= 0 && top < 64; i--) {
+            stack[top++] = ts_node_named_child(n, (uint32_t)i);
+        }
+    }
+    cs_collect_class_fields(ctx, NULL, root, tab);
+    ctx->namespace_count = 0;
+    ctx->file_fields = tab;
 }
 
 /* ── extract method return types directly from AST ──────────────
@@ -3469,6 +3663,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->name;
+            rt.namespace_qn =
+                cs_top_level_namespace(d->qualified_name, d->name, module_qn, d->decl_namespace);
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             if (d->base_classes) {
                 int bc = 0;
@@ -3620,6 +3816,21 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 /* ── cross-file entry ───────────────────────────────────────────── */
 
+/* The type's declared `namespace_name` when `type_qn` is a TOP-LEVEL type of
+ * the file whose module QN is `module_qn` (top-level C# type QNs are exactly
+ * module.Name; nested ones are module.Outer.Name and stay NULL, since a nested
+ * type is not reachable by its simple name through a namespace). */
+static const char *cs_top_level_namespace(const char *type_qn, const char *short_name,
+                                          const char *module_qn, const char *namespace_name) {
+    if (!type_qn || !short_name || !module_qn || !namespace_name || !namespace_name[0])
+        return NULL;
+    size_t mlen = strlen(module_qn);
+    if (strncmp(type_qn, module_qn, mlen) != 0 || type_qn[mlen] != '.' ||
+        strcmp(type_qn + mlen + 1, short_name) != 0)
+        return NULL;
+    return namespace_name;
+}
+
 /* Register one batch of CBMLSPDef[] into a registry. Shared by the
  * per-file cross-LSP path and the Tier 2 pre-built registry builder.
  * Def-driven (no per-file AST mutation) so deterministic per def set. */
@@ -3636,6 +3847,8 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
+            rt.namespace_qn = cs_top_level_namespace(d->qualified_name, d->short_name,
+                                                     d->def_module_qn, d->namespace_name);
             rt.is_interface = d->is_interface || (strcmp(d->label, "Interface") == 0);
             if (d->embedded_types && *d->embedded_types) {
                 /* Parse "|"-separated list. */
@@ -3743,7 +3956,9 @@ CBMTypeRegistry *cbm_cs_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     }
     cs_register_lsp_defs(arena, reg, cs, type_count);
     cbm_registry_finalize(reg);
-    cs_register_lsp_defs(arena, reg, cs + type_count, total - type_count);
+    if (total > type_count) { /* cs is NULL for an empty corpus: no offset */
+        cs_register_lsp_defs(arena, reg, cs + type_count, total - type_count);
+    }
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
@@ -3763,8 +3978,9 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_c_sharp());
-        tree = ts_parser_parse_string(
-            parser, NULL, source, source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source));
+        tree = cbm_parse_source(parser, source,
+                                source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source),
+                                (TSParseOptions){0});
         ts_parser_delete(parser);
         owns = true;
     }
@@ -3779,6 +3995,8 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
             cs_lsp_add_using(&ctx, CBM_CS_USING_NAMESPACE, "", using_targets[i], false);
         }
     }
+    cs_fields_table_t file_fields = {0};
+    cs_collect_file_fields(&ctx, root, &file_fields);
     cs_lsp_process_file(&ctx, root);
 
     if (owns)
@@ -3805,8 +4023,9 @@ void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_c_sharp());
-        tree = ts_parser_parse_string(
-            parser, NULL, source, source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source));
+        tree = cbm_parse_source(parser, source,
+                                source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source),
+                                (TSParseOptions){0});
         ts_parser_delete(parser);
         owns = true;
     }
@@ -3827,6 +4046,8 @@ void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
             cs_lsp_add_using(&ctx, CBM_CS_USING_NAMESPACE, "", using_targets[i], false);
         }
     }
+    cs_fields_table_t file_fields = {0};
+    cs_collect_file_fields(&ctx, root, &file_fields);
     cs_lsp_process_file(&ctx, root);
 
     if (owns)
